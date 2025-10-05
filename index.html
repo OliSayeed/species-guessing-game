@@ -5,9 +5,9 @@
   <title>Species Guessing Game</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    :root { --card: #fff; --ink: #111; --muted: #666; --line: #e5e7eb; --good: #0a7d25; --bad:#a60d0d; }
+    :root { --card:#fff; --ink:#111; --muted:#666; --line:#e5e7eb; --good:#0a7d25; --bad:#a60d0d; }
     html,body{margin:0;padding:0;background:#fafafa;color:var(--ink);font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;}
-    .wrap{max-width:860px;margin:32px auto;padding:0 16px;}
+    .wrap{max-width:900px;margin:32px auto;padding:0 16px;}
     h1{margin:0 0 6px}
     .muted{color:var(--muted)}
     .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
@@ -16,13 +16,11 @@
     button:hover{background:#f3f4f6}
     .pill{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border:1px solid var(--line);border-radius:999px;background:#fff}
     .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-    .stack{display:flex;flex-direction:column;gap:10px}
     .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}
     .good{color:var(--good);font-weight:700}
     .bad{color:var(--bad);font-weight:700}
-    .grid{display:grid;grid-template-columns:1fr auto;gap:8px}
     .small{font-size:14px}
-    .list{display:flex;flex-direction:column-reverse;gap:10px} /* newest first */
+    .list{display:flex;flex-direction:column-reverse;gap:10px}
     .section{margin-top:18px}
     .sr{position:absolute;left:-9999px}
     .footer{margin-top:28px;color:var(--muted);font-size:14px}
@@ -31,17 +29,18 @@
 <body>
 <div class="wrap">
   <h1>Species Guessing Game</h1>
-  <p class="muted">Guess any species (common or scientific). I’ll reveal the <em>MRCA</em> with the secret target so you can triangulate it.</p>
+  <p class="muted">Guess any species (scientific works best). I’ll reveal the <em>MRCA</em> with the secret target so you can triangulate it.</p>
 
   <div class="row section">
     <button id="newgame">New game</button>
     <span id="turns" class="pill">turns: 0</span>
-    <span id="targetHint" class="pill small"></span>
+    <span id="pool" class="pill small">pool: …</span>
+    <span id="hint" class="pill small"></span>
   </div>
 
   <div class="row section">
     <label class="sr" for="guess">Your guess</label>
-    <input id="guess" type="text" list="seednames" placeholder="e.g., hoatzin or Opisthocomus hoazin" />
+    <input id="guess" type="text" list="seednames" placeholder="e.g., Opisthocomus hoazin" />
     <datalist id="seednames"></datalist>
     <button id="submit">Guess</button>
   </div>
@@ -53,170 +52,231 @@
     <div id="log" class="list"></div>
   </div>
 
-  <div class="footer">Powered by OpenTree (TNRS + MRCA). Entirely client-side — no installs needed.</div>
+  <div class="footer">Powered by OpenTree (TNRS + MRCA) and OneZoom (vernaculars). All client-side.</div>
 </div>
 
 <script>
   // -------------------------------
-  // Config (OpenTree API endpoints)
+  // Config (OpenTree + OneZoom)
   // -------------------------------
   const OT_BASE = "https://api.opentreeoflife.org/v3";
   const TNRS_URL = `${OT_BASE}/tnrs/match_names`;
   const MRCA_URL = `${OT_BASE}/tree_of_life/mrca`;
   const NODE_INFO_URL = `${OT_BASE}/tree_of_life/node_info`;
+  const TAXON_INFO_URL = `${OT_BASE}/taxonomy/taxon_info`;
+  const OZ_VERNACULAR_URL = "https://api.onezoom.org/vernacular_names.json"; // ?ott=<id>&lang=en
+
+  // Path to the big list (one scientific name per line)
+  const TXT_PATH = "extracted_species.txt";
 
   // -------------------------------
-  // Seed playable species (OTT IDs)
-  // You can expand/replace this later with a generated JSON.
+  // Minimal seed (fallbacks + some common names)
   // -------------------------------
   const SEED = [
-    // Afrotheria reps + friends (mammals)
     {ott:770315, sci:"Orycteropus afer", common:"Aardvark"},
     {ott:770309, sci:"Loxodonta africana", common:"African elephant"},
     {ott:770311, sci:"Elephas maximus", common:"Asian elephant"},
-    {ott:770322, sci:"Dugong dugon", common:"Dugong"},
-    {ott:770321, sci:"Trichechus manatus", common:"American manatee"},
-    {ott:770318, sci:"Procavia capensis", common:"Rock hyrax"},
-    {ott:987545, sci:"Tenrec ecaudatus", common:"Common tenrec"},
-    {ott:770320, sci:"Rhynchocyon petersi", common:"Black-and-rufous elephant shrew"},
-
-    // Birds
     {ott:292466, sci:"Opisthocomus hoazin", common:"Hoatzin"},
-    {ott:81461,  sci:"Struthio camelus",   common:"Ostrich"},
-    {ott:144183, sci:"Corvus corax",        common:"Common raven"},
-    {ott:803750, sci:"Sturnus vulgaris",    common:"Common starling"},
-
-    // Plants (Poaceae +)
-    {ott:412129, sci:"Zea mays",            common:"Maize"},
-    {ott:241806, sci:"Triticum aestivum",   common:"Bread wheat"},
-    {ott:423369, sci:"Oryza sativa",        common:"Rice"},
-    {ott:536338, sci:"Bambusa vulgaris",    common:"Common bamboo"},
-    {ott:555741, sci:"Hordeum vulgare",     common:"Barley"},
-    {ott:292270, sci:"Avena sativa",        common:"Oat"},
-
-    // Invertebrates
-    {ott:301648, sci:"Coccinella septempunctata", common:"Seven-spot ladybird"},
-    {ott:344103, sci:"Lampyris noctiluca",        common:"Common glow-worm"},
-    {ott:1016910,sci:"Lucanus cervus",            common:"European stag beetle"},
+    {ott:144183, sci:"Corvus corax", common:"Common raven"},
+    {ott:412129, sci:"Zea mays", common:"Maize"},
+    {ott:1016910,sci:"Lucanus cervus", common:"European stag beetle"},
   ];
 
-  // Build quick lookup maps for offline matching
+  // Indexes for fast lookup of the seed names (keeps common names working for those)
   const NAME2OTT = new Map();
-  const OTT2NAME = new Map();
+  const OTT2ROW = new Map();
   for (const s of SEED) {
     NAME2OTT.set(s.sci.toLowerCase(), s.ott);
-    NAME2OTT.set(s.common.toLowerCase(), s.ott);
-    OTT2NAME.set(s.ott, s);
+    if (s.common) NAME2OTT.set(s.common.toLowerCase(), s.ott);
+    OTT2ROW.set(s.ott, s);
   }
 
-  // Fill datalist for light autocomplete
-  const dl = document.getElementById("seednames");
-  for (const s of SEED) {
-    for (const v of [s.common, s.sci]) {
-      const o = document.createElement("option"); o.value = v; dl.appendChild(o);
+  // -------------------------------
+  // Load the big text list
+  // -------------------------------
+  let LIST = []; // [{sci, ott:null, common:null}]
+  async function loadTxtList() {
+    try {
+      const r = await fetch(TXT_PATH, {cache:"no-store"});
+      if (!r.ok) throw new Error("not found");
+      const text = await r.text();
+      const lines = text.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+      // Basic sanity filter: Genus species (allow trinomial)
+      const genus = /[A-Z][a-zà-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ\-]*/.source;
+      const epithet = /(?:×\s*)?[a-zà-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ\-]*/.source;
+      const sciRe = new RegExp(`^${genus}\\s+${epithet}(?:\\s+${epithet}){0,2}$`);
+      const seen = new Set();
+      LIST = lines.filter(s => sciRe.test(s)).filter(s => {
+        if (seen.has(s.toLowerCase())) return false;
+        seen.add(s.toLowerCase()); return true;
+      }).map(s => ({sci:s, ott:null, common:null}));
+      setPool(LIST.length);
+      addToDatalist(); // for lightweight typeahead
+    } catch (e) {
+      // If the file is missing, still run with seeds
+      setPool(SEED.length);
     }
   }
 
   // -------------------------------
-  // Game state (client-side only)
-  // -------------------------------
-  let target = null;      // {ott, sci, common}
-  let turns = 0;
-  const history = [];     // array of entries rendered to the log
-
-  // -------------------------------
-  // Helpers: OpenTree calls
+  // OpenTree / OneZoom helpers
   // -------------------------------
   async function tnrsResolve(name) {
-    // Returns {ott, sci} or null
     try {
       const r = await fetch(TNRS_URL, {
         method:"POST",
         headers:{ "Content-Type":"application/json" },
-        body: JSON.stringify({ names: [name], do_approximate_matching: true })
+        body: JSON.stringify({ names:[name], do_approximate_matching:true })
       });
       if (!r.ok) return null;
       const j = await r.json();
-      const res = j?.results?.[0]?.matches?.[0]?.taxon;
-      if (!res?.ott_id || !res?.name) return null;
-      return { ott: res.ott_id, sci: res.name };
+      const tax = j?.results?.[0]?.matches?.[0]?.taxon;
+      if (!tax?.ott_id || !tax?.name) return null;
+      return { ott: tax.ott_id, sci: tax.name, rank: tax.rank || null };
     } catch { return null; }
   }
 
-  async function mrcaOf(ottA, ottB) {
-    // Returns {name, ott, tips} (best effort)
+  async function fetchNodeInfo(node_id, include_lineage=false) {
+    try {
+      const r = await fetch(NODE_INFO_URL, {
+        method:"POST", headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify({ node_id, include_lineage })
+      });
+      if (!r.ok) return null;
+      return await r.json();
+    } catch { return null; }
+  }
+
+  async function mrcaLabeled(ottA, ottB) {
     try {
       const r = await fetch(MRCA_URL, {
         method:"POST", headers:{ "Content-Type":"application/json" },
-        body: JSON.stringify({ ott_ids: [ottA, ottB] })
+        body: JSON.stringify({ ott_ids:[ottA, ottB] })
       });
-      if (!r.ok) return { name:null, ott:null, tips:null };
-      const node_id = (await r.json()).node_id;
-      if (!node_id) return { name:null, ott:null, tips:null };
-      const r2 = await fetch(NODE_INFO_URL, {
-        method:"POST", headers:{ "Content-Type":"application/json" },
-        body: JSON.stringify({ node_id, include_lineage:false })
-      });
-      if (!r2.ok) return { name:null, ott:null, tips:null };
-      const j2 = await r2.json();
-      return { name: j2.name ?? null, ott: j2.ott_id ?? null, tips: (j2.num_tips ?? j2.num_synth_tips ?? null) };
-    } catch { return { name:null, ott:null, tips:null }; }
+      if (!r.ok) return {label:"unknown", ott:null, tips:null};
+      const node_id = (await r.json())?.node_id;
+      if (!node_id) return {label:"unknown", ott:null, tips:null};
+      let info = await fetchNodeInfo(node_id, false);
+      if (!info) return {label:"unknown", ott:null, tips:null};
+      const tips = info.num_tips ?? info.num_synth_tips ?? null;
+      if (info.name || info.unique_name) {
+        return {label:(info.name||info.unique_name), ott:(info.ott_id??null), tips};
+      }
+      // climb lineage until we find a name
+      info = await fetchNodeInfo(node_id, true);
+      if (info?.lineage && info.lineage.length) {
+        // Prefer nearest named ancestor
+        for (const anc of info.lineage) {
+          const nm = anc.name || anc.unique_name;
+          if (nm) return {label:nm, ott:(anc.ott_id??null), tips};
+        }
+      }
+      return {label:"unnamed MRCA", ott:null, tips};
+    } catch {
+      return {label:"unknown", ott:null, tips:null};
+    }
+  }
+
+  async function getVernacularEN(ott){
+    try {
+      const r = await fetch(`${OZ_VERNACULAR_URL}?ott=${ott}&lang=en`, {cache:"no-store"});
+      if (!r.ok) return null;
+      const j = await r.json();
+      const k = Object.keys(j)[0];
+      return (k && j[k]) ? j[k] : null;
+    } catch { return null; }
   }
 
   // -------------------------------
   // UI helpers
   // -------------------------------
   function el(id){ return document.getElementById(id); }
-  function setTurns(n){ turns = n; el("turns").textContent = `turns: ${turns}`; }
-  function clearLog(){ el("log").innerHTML = ""; history.length = 0; }
+  function setTurns(n){ el("turns").textContent = `turns: ${n}`; }
+  function setPool(n){ el("pool").textContent = `pool: ${n}`; }
+  function setHint(t){ el("hint").textContent = t || ""; }
+  function clearLog(){ el("log").innerHTML = ""; }
   function addLog(entry){
-    history.push(entry);
     const box = document.createElement("div");
     box.className = "card small";
     if (!entry.resolved) {
-      box.innerHTML = `
-        <div><strong>Guess:</strong> ${entry.raw}</div>
-        <div class="bad">Not recognized.</div>
-      `;
+      box.innerHTML = `<div><strong>Guess:</strong> ${entry.raw}</div><div class="bad">Not recognized.</div>`;
     } else if (entry.correct) {
-      box.innerHTML = `
-        <div><strong>Guess:</strong> ${entry.raw}</div>
+      box.innerHTML = `<div><strong>Guess:</strong> ${entry.raw}</div>
         <div>Resolved: <span class="mono">${entry.guess_name}</span> (OTT ${entry.guess_ott})</div>
-        <div class="good">Correct! 🎉</div>
-      `;
+        <div class="good">Correct! 🎉</div>`;
     } else {
-      const mrcaBits = entry.mrca_name ? `${entry.mrca_name} ${entry.mrca_ott ? `(OTT ${entry.mrca_ott})` : ""}` : "unknown";
       const tips = entry.mrca_tips != null ? ` • clade size: ${entry.mrca_tips}` : "";
-      box.innerHTML = `
-        <div><strong>Guess:</strong> ${entry.raw}</div>
+      box.innerHTML = `<div><strong>Guess:</strong> ${entry.raw}</div>
         <div>Resolved: <span class="mono">${entry.guess_name}</span> (OTT ${entry.guess_ott})</div>
-        <div>MRCA: <span class="mono">${mrcaBits}</span>${tips}</div>
-      `;
+        <div>MRCA: <span class="mono">${entry.mrca_label}${entry.mrca_ott ? ` (OTT ${entry.mrca_ott})` : ""}</span>${tips}</div>`;
     }
-    el("log").appendChild(box); // list is column-reverse via CSS
+    el("log").prepend(box);
   }
 
-  function showStatusFound(sp){
+  function showStatusFound(sp, turns){
     const t = el("status");
     t.style.display = "block";
-    t.innerHTML = `
-      <div class="good">You found it in ${turns} turn${turns===1?"":"s"}.</div>
-      <div><strong>Target:</strong> ${sp.common || sp.sci} <span class="mono">(${sp.sci})</span> — OTT ${sp.ott}</div>
-    `;
+    t.innerHTML = `<div class="good">You found it in ${turns} turn${turns===1?"":"s"}.</div>
+      <div><strong>Target:</strong> ${sp.common ? `${sp.common} — ` : ""}<span class="mono">${sp.sci}</span> • OTT ${sp.ott}</div>`;
+  }
+
+  function addToDatalist(){
+    const dl = el("seednames");
+    dl.innerHTML = "";
+    // limit to the first 1500 to keep datalist snappy
+    const sample = LIST.slice(0, 1500);
+    for (const s of sample) {
+      const o = document.createElement("option"); o.value = s.sci; dl.appendChild(o);
+    }
+    // also add seed common names
+    for (const s of SEED) {
+      if (s.common) { const o = document.createElement("option"); o.value = s.common; dl.appendChild(o); }
+    }
   }
 
   // -------------------------------
-  // Game actions
+  // Game state
   // -------------------------------
-  function newGame(){
-    // Pick a random target from the current seed pool
-    target = SEED[Math.floor(Math.random()*SEED.length)];
-    setTurns(0);
+  let target = null; // {sci, ott, common}
+  let turns = 0;
+
+  function pickRandomFromList(){
+    if (!LIST.length) return SEED[Math.floor(Math.random()*SEED.length)];
+    const i = Math.floor(Math.random()*LIST.length);
+    return {...LIST[i]}; // copy (we'll fill ott/common)
+  }
+
+  async function ensureResolved(sp){
+    // Fill ott (and normalized sci) via TNRS; grab vernacular if possible
+    if (!sp || sp.ott) return sp;
+    const r = await tnrsResolve(sp.sci);
+    if (!r || !r.ott) return sp;
+    sp.ott = r.ott;
+    sp.sci = r.sci; // TNRS-normalized spelling
+    const vn = await getVernacularEN(sp.ott);
+    if (vn) sp.common = vn;
+    return sp;
+  }
+
+  async function newGame(){
+    setHint("choosing…");
+    target = pickRandomFromList();
+    // try up to a few times to get a resolvable species
+    for (let k=0;k<8 && (!target.ott);k++){
+      target = await ensureResolved(target);
+      if (!target.ott) target = pickRandomFromList();
+    }
+    if (!target.ott) {
+      // hard fallback: pick a seed with known OTT
+      target = SEED[Math.floor(Math.random()*SEED.length)];
+      setHint("(fallback target)");
+    } else {
+      setHint(target.common ? target.common : target.sci);
+    }
+    turns = 0; setTurns(turns);
     clearLog();
     el("status").style.display = "none";
-    el("targetHint").textContent = ""; // placeholder for future (e.g., kingdom)
-    el("guess").value = "";
-    el("guess").focus();
+    el("guess").value = ""; el("guess").focus();
   }
 
   async function submitGuess(){
@@ -224,56 +284,44 @@
     const raw = el("guess").value.trim();
     if (!raw) return;
 
-    // 1) resolve guess to an OTT id (try local, then TNRS)
+    // resolve guess: first try local seed map (so some common names work), then TNRS
     let guessOtt = NAME2OTT.get(raw.toLowerCase());
-    let guessName = null; // display canonical sci name
+    let guessName = null;
 
     if (guessOtt) {
-      // use local sci name if available
-      guessName = OTT2NAME.get(guessOtt)?.sci || raw;
+      guessName = OTT2ROW.get(guessOtt)?.sci || raw;
     } else {
       const tnrs = await tnrsResolve(raw);
       if (!tnrs) {
-        setTurns(turns+1);
-        addLog({ raw, resolved:false });
-        el("guess").value = "";
-        el("guess").focus();
-        return;
+        turns++; setTurns(turns); addLog({ raw, resolved:false });
+        el("guess").value = ""; el("guess").focus(); return;
       }
-      guessOtt = tnrs.ott;
-      guessName = tnrs.sci;
+      guessOtt = tnrs.ott; guessName = tnrs.sci;
     }
 
-    const correct = (guessOtt === target.ott);
-    setTurns(turns+1);
+    turns++; setTurns(turns);
 
-    if (correct) {
-      addLog({ raw, resolved:true, correct:true, guess_ott: guessOtt, guess_name: guessName });
-      showStatusFound(target);
-      el("guess").value = "";
-      el("guess").focus();
-      return;
+    if (guessOtt === target.ott) {
+      addLog({ raw, resolved:true, correct:true, guess_ott:guessOtt, guess_name:guessName });
+      showStatusFound(target, turns);
+      el("guess").value = ""; el("guess").focus(); return;
     }
 
-    // 2) not correct → MRCA
-    const m = await mrcaOf(target.ott, guessOtt);
+    const m = await mrcaLabeled(target.ott, guessOtt);
     addLog({
       raw, resolved:true, correct:false,
-      guess_ott: guessOtt, guess_name: guessName,
-      mrca_name: m.name, mrca_ott: m.ott, mrca_tips: m.tips
+      guess_ott:guessOtt, guess_name:guessName,
+      mrca_label:m.label, mrca_ott:m.ott, mrca_tips:m.tips
     });
-
-    el("guess").value = "";
-    el("guess").focus();
+    el("guess").value = ""; el("guess").focus();
   }
 
-  // Wire up UI
+  // Wire up UI + boot
   document.getElementById("newgame").addEventListener("click", newGame);
   document.getElementById("submit").addEventListener("click", submitGuess);
-  document.getElementById("guess").addEventListener("keydown", (e)=>{ if (e.key==="Enter") submitGuess(); });
+  document.getElementById("guess").addEventListener("keydown", e=>{ if (e.key==="Enter") submitGuess(); });
 
-  // auto-start one
-  newGame();
+  loadTxtList().then(newGame);
 </script>
 </body>
 </html>
