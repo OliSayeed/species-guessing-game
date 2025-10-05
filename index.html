@@ -66,7 +66,7 @@
   const TAXON_INFO_URL = `${OT_BASE}/taxonomy/taxon_info`;
   const OZ_VERNACULAR_URL = "https://api.onezoom.org/vernacular_names.json"; // ?ott=<id>&lang=en
 
-  // Path to the big list (one scientific name per line)
+  // Your big list (one scientific name per line)
   const TXT_PATH = "extracted_species.txt";
 
   // -------------------------------
@@ -79,10 +79,9 @@
     {ott:292466, sci:"Opisthocomus hoazin", common:"Hoatzin"},
     {ott:144183, sci:"Corvus corax", common:"Common raven"},
     {ott:412129, sci:"Zea mays", common:"Maize"},
-    {ott:1016910,sci:"Lucanus cervus", common:"European stag beetle"},
+    {ott:1016910,sci:"Lucanus cervus", common:"European stag beetle"}
   ];
 
-  // Indexes for fast lookup of the seed names (keeps common names working for those)
   const NAME2OTT = new Map();
   const OTT2ROW = new Map();
   for (const s of SEED) {
@@ -101,19 +100,16 @@
       if (!r.ok) throw new Error("not found");
       const text = await r.text();
       const lines = text.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-      // Basic sanity filter: Genus species (allow trinomial)
       const genus = /[A-Z][a-zà-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ\-]*/.source;
       const epithet = /(?:×\s*)?[a-zà-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ\-]*/.source;
       const sciRe = new RegExp(`^${genus}\\s+${epithet}(?:\\s+${epithet}){0,2}$`);
       const seen = new Set();
       LIST = lines.filter(s => sciRe.test(s)).filter(s => {
-        if (seen.has(s.toLowerCase())) return false;
-        seen.add(s.toLowerCase()); return true;
+        const k = s.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true;
       }).map(s => ({sci:s, ott:null, common:null}));
       setPool(LIST.length);
-      addToDatalist(); // for lightweight typeahead
-    } catch (e) {
-      // If the file is missing, still run with seeds
+      addToDatalist();
+    } catch {
       setPool(SEED.length);
     }
   }
@@ -147,33 +143,75 @@
     } catch { return null; }
   }
 
+  // Taxonomy lineage for a tip: deepest-first list of named ancestors (excluding "cellular organisms")
+  async function taxonomyLineage(ott) {
+    try {
+      const r = await fetch(TAXON_INFO_URL, {
+        method:"POST", headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify({ ott_id: ott, include_lineage: true })
+      });
+      if (!r.ok) return [];
+      const j = await r.json();
+      const lin = Array.isArray(j.lineage) ? j.lineage : [];
+      // API tends to return root→tip; we want deepest-first for easy MRCA
+      const cleaned = lin
+        .filter(a => (a.name || a.unique_name))
+        .filter(a => (a.name || a.unique_name) !== "cellular organisms")
+        .map(a => ({ name: a.name || a.unique_name, ott: a.ott_id || null }));
+      return cleaned.reverse(); // now nearest ancestor first
+    } catch { return []; }
+  }
+
+  // Fallback MRCA via taxonomy: deepest shared named ancestor
+  async function mrcaByTaxonomy(ottA, ottB) {
+    const la = await taxonomyLineage(ottA);
+    const lb = await taxonomyLineage(ottB);
+    if (!la.length || !lb.length) return { label: "unknown", ott: null, tips: null };
+    const setB = new Map(lb.map(n => [n.name, n])); // names are stable enough here
+    for (const n of la) {
+      if (setB.has(n.name)) {
+        const hit = setB.get(n.name);
+        return { label: n.name, ott: hit.ott || n.ott || null, tips: null };
+      }
+    }
+    return { label: "unknown", ott: null, tips: null };
+  }
+
+  // Robust MRCA label: synth first, then taxonomy fallback
   async function mrcaLabeled(ottA, ottB) {
     try {
+      // Synth MRCA
       const r = await fetch(MRCA_URL, {
         method:"POST", headers:{ "Content-Type":"application/json" },
         body: JSON.stringify({ ott_ids:[ottA, ottB] })
       });
-      if (!r.ok) return {label:"unknown", ott:null, tips:null};
-      const node_id = (await r.json())?.node_id;
-      if (!node_id) return {label:"unknown", ott:null, tips:null};
-      let info = await fetchNodeInfo(node_id, false);
-      if (!info) return {label:"unknown", ott:null, tips:null};
-      const tips = info.num_tips ?? info.num_synth_tips ?? null;
-      if (info.name || info.unique_name) {
-        return {label:(info.name||info.unique_name), ott:(info.ott_id??null), tips};
-      }
-      // climb lineage until we find a name
-      info = await fetchNodeInfo(node_id, true);
-      if (info?.lineage && info.lineage.length) {
-        // Prefer nearest named ancestor
-        for (const anc of info.lineage) {
-          const nm = anc.name || anc.unique_name;
-          if (nm) return {label:nm, ott:(anc.ott_id??null), tips};
+      if (r.ok) {
+        const node_id = (await r.json())?.node_id;
+        if (node_id) {
+          let info = await fetchNodeInfo(node_id, false);
+          if (info) {
+            const tips = info.num_tips ?? info.num_synth_tips ?? null;
+            const direct = info.name || info.unique_name;
+            if (direct) return { label: direct, ott: (info.ott_id ?? null), tips };
+            // try lineage on synth
+            info = await fetchNodeInfo(node_id, true);
+            if (info?.lineage && info.lineage.length) {
+              const nearestNamed = [...info.lineage].reverse().find(a => a.name || a.unique_name);
+              if (nearestNamed) {
+                return {
+                  label: nearestNamed.name || nearestNamed.unique_name,
+                  ott: nearestNamed.ott_id ?? null,
+                  tips
+                };
+              }
+            }
+          }
         }
       }
-      return {label:"unnamed MRCA", ott:null, tips};
+      // Fallback: taxonomy intersection
+      return await mrcaByTaxonomy(ottA, ottB);
     } catch {
-      return {label:"unknown", ott:null, tips:null};
+      return await mrcaByTaxonomy(ottA, ottB);
     }
   }
 
@@ -223,12 +261,10 @@
   function addToDatalist(){
     const dl = el("seednames");
     dl.innerHTML = "";
-    // limit to the first 1500 to keep datalist snappy
     const sample = LIST.slice(0, 1500);
     for (const s of sample) {
       const o = document.createElement("option"); o.value = s.sci; dl.appendChild(o);
     }
-    // also add seed common names
     for (const s of SEED) {
       if (s.common) { const o = document.createElement("option"); o.value = s.common; dl.appendChild(o); }
     }
@@ -243,16 +279,15 @@
   function pickRandomFromList(){
     if (!LIST.length) return SEED[Math.floor(Math.random()*SEED.length)];
     const i = Math.floor(Math.random()*LIST.length);
-    return {...LIST[i]}; // copy (we'll fill ott/common)
+    return {...LIST[i]};
   }
 
   async function ensureResolved(sp){
-    // Fill ott (and normalized sci) via TNRS; grab vernacular if possible
     if (!sp || sp.ott) return sp;
     const r = await tnrsResolve(sp.sci);
     if (!r || !r.ott) return sp;
     sp.ott = r.ott;
-    sp.sci = r.sci; // TNRS-normalized spelling
+    sp.sci = r.sci;
     const vn = await getVernacularEN(sp.ott);
     if (vn) sp.common = vn;
     return sp;
@@ -261,13 +296,11 @@
   async function newGame(){
     setHint("choosing…");
     target = pickRandomFromList();
-    // try up to a few times to get a resolvable species
     for (let k=0;k<8 && (!target.ott);k++){
       target = await ensureResolved(target);
       if (!target.ott) target = pickRandomFromList();
     }
     if (!target.ott) {
-      // hard fallback: pick a seed with known OTT
       target = SEED[Math.floor(Math.random()*SEED.length)];
       setHint("(fallback target)");
     } else {
@@ -284,7 +317,6 @@
     const raw = el("guess").value.trim();
     if (!raw) return;
 
-    // resolve guess: first try local seed map (so some common names work), then TNRS
     let guessOtt = NAME2OTT.get(raw.toLowerCase());
     let guessName = null;
 
