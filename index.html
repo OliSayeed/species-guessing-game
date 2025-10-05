@@ -29,7 +29,7 @@
 <body>
 <div class="wrap">
   <h1>Species Guessing Game</h1>
-  <p class="muted">Guess any species (scientific works best). I’ll reveal the <em>MRCA</em> with the secret target so you can triangulate it.</p>
+  <p class="muted">Guess any species (scientific works best). I’ll reveal the <em>MRCA</em> with the secret target to guide you.</p>
 
   <div class="row section">
     <button id="newgame">New game</button>
@@ -66,7 +66,7 @@
   const TAXON_INFO_URL = `${OT_BASE}/taxonomy/taxon_info`;
   const OZ_VERNACULAR_URL = "https://api.onezoom.org/vernacular_names.json"; // ?ott=<id>&lang=en
 
-  // Your big list (one scientific name per line)
+  // Big list (one scientific name per line)
   const TXT_PATH = "extracted_species.txt";
 
   // -------------------------------
@@ -143,7 +143,25 @@
     } catch { return null; }
   }
 
-  // Taxonomy lineage for a tip: deepest-first list of named ancestors (excluding "cellular organisms")
+  // Normalize lineage orientation to NEAREST-FIRST (tip→root)
+  function toNearestFirst(lineageArr){
+    const arr = Array.isArray(lineageArr) ? lineageArr.slice() : [];
+    if (!arr.length) return [];
+    const firstName = (arr[0].name || arr[0].unique_name || "").toLowerCase();
+    const firstOtt = arr[0].ott_id || null;
+    const looksRootFirst = firstOtt === 805080 || firstName === "life" || firstName === "cellular organisms";
+    const out = looksRootFirst ? arr.reverse() : arr;
+    // strip true roots
+    return out.filter(a => {
+      const nm = (a.name || a.unique_name || "").toLowerCase();
+      const id = a.ott_id || null;
+      if (id === 805080) return false; // life
+      if (nm === "life" || nm === "cellular organisms") return false;
+      return true;
+    });
+  }
+
+  // Taxonomy lineage for a tip → nearest-first, with {name, ott}
   async function taxonomyLineage(ott) {
     try {
       const r = await fetch(TAXON_INFO_URL, {
@@ -152,26 +170,20 @@
       });
       if (!r.ok) return [];
       const j = await r.json();
-      const lin = Array.isArray(j.lineage) ? j.lineage : [];
-      // API tends to return root→tip; we want deepest-first for easy MRCA
-      const cleaned = lin
-        .filter(a => (a.name || a.unique_name))
-        .filter(a => (a.name || a.unique_name) !== "cellular organisms")
-        .map(a => ({ name: a.name || a.unique_name, ott: a.ott_id || null }));
-      return cleaned.reverse(); // now nearest ancestor first
+      const nf = toNearestFirst(j.lineage || []);
+      return nf.map(a => ({ name: a.name || a.unique_name, ott: a.ott_id || null }));
     } catch { return []; }
   }
 
-  // Fallback MRCA via taxonomy: deepest shared named ancestor
+  // Fallback MRCA via taxonomy: deepest shared **ancestor by OTT id**
   async function mrcaByTaxonomy(ottA, ottB) {
     const la = await taxonomyLineage(ottA);
     const lb = await taxonomyLineage(ottB);
     if (!la.length || !lb.length) return { label: "unknown", ott: null, tips: null };
-    const setB = new Map(lb.map(n => [n.name, n])); // names are stable enough here
+    const setB = new Set(lb.map(n => n.ott).filter(Boolean));
     for (const n of la) {
-      if (setB.has(n.name)) {
-        const hit = setB.get(n.name);
-        return { label: n.name, ott: hit.ott || n.ott || null, tips: null };
+      if (n.ott && setB.has(n.ott)) {
+        return { label: n.name, ott: n.ott, tips: null };
       }
     }
     return { label: "unknown", ott: null, tips: null };
@@ -192,17 +204,19 @@
           if (info) {
             const tips = info.num_tips ?? info.num_synth_tips ?? null;
             const direct = info.name || info.unique_name;
-            if (direct) return { label: direct, ott: (info.ott_id ?? null), tips };
-            // try lineage on synth
+            if (direct && (direct.toLowerCase() !== "life")) {
+              return { label: direct, ott: (info.ott_id ?? null), tips };
+            }
+            // lineage on synth
             info = await fetchNodeInfo(node_id, true);
             if (info?.lineage && info.lineage.length) {
-              const nearestNamed = [...info.lineage].reverse().find(a => a.name || a.unique_name);
+              const nf = toNearestFirst(info.lineage);
+              const nearestNamed = nf.find(a => (a.name || a.unique_name));
               if (nearestNamed) {
-                return {
-                  label: nearestNamed.name || nearestNamed.unique_name,
-                  ott: nearestNamed.ott_id ?? null,
-                  tips
-                };
+                const nm = nearestNamed.name || nearestNamed.unique_name;
+                if (nm.toLowerCase() !== "life") {
+                  return { label: nm, ott: (nearestNamed.ott_id ?? null), tips };
+                }
               }
             }
           }
