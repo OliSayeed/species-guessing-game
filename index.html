@@ -2,9 +2,8 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Species Guessing Game — Partial Tree</title>
+  <title>Species Guessing Game — Partial Tree (Fast)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <!-- d3 from CDN -->
   <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
   <style>
     :root { --card:#fff; --ink:#111; --muted:#666; --line:#e5e7eb; --good:#0a7d25; --bad:#a60d0d; }
@@ -24,32 +23,28 @@
     .small{font-size:14px}
     .section{margin-top:16px}
     .footer{margin-top:28px;color:var(--muted);font-size:14px}
-
-    /* canvas */
     .viswrap{background:#fff;border:1px solid var(--line);border-radius:14px;overflow:hidden}
     svg{display:block;width:100%;height:520px;background:#fff;touch-action:none}
     .link{fill:none;stroke:#cbd5e1;stroke-width:1.2px}
-    .node circle{r:3;fill:#555}
     .leaf text{font-size:13px;dominant-baseline:middle}
     .leaf .label{fill:#111}
     .leaf .label.target{font-weight:700}
     .leaf .hint{fill:#666;font-size:12px}
-    .tooltip{
-      position:fixed;pointer-events:none;background:#111;color:#fff;
-      padding:6px 8px;border-radius:8px;font-size:12px;opacity:0;transition:opacity .12s ease;
-    }
+    .tooltip{position:fixed;pointer-events:none;background:#111;color:#fff;padding:6px 8px;border-radius:8px;font-size:12px;opacity:0;transition:opacity .12s ease;}
+    .busy{opacity:.6}
   </style>
 </head>
 <body>
 <div class="wrap">
   <h1>Species Guessing Game</h1>
-  <p class="muted">We reveal just the part of the tree needed to compare your guesses with the secret target. Leaves are your guesses (scientific names); the target is <strong>?</strong>. The view auto-zooms to the relevant clade.</p>
+  <p class="muted">We reveal just the part of the tree needed to compare your guesses with the secret target. Leaves are your guesses; the target is <strong>?</strong>. The view auto-zooms to the relevant clade.</p>
 
   <div class="row section">
     <button id="newgame">New game</button>
     <span id="turns" class="pill">turns: 0</span>
     <span id="pool" class="pill small">pool: …</span>
     <span id="hint" class="pill small"></span>
+    <span id="net" class="pill small">idle</span>
   </div>
 
   <div class="row section">
@@ -64,7 +59,7 @@
 
   <div id="status" class="card section" style="display:none;"></div>
 
-  <div class="footer">Data: OpenTree (TNRS + induced subtree) and OneZoom (vernaculars). Rendered client-side with D3.</div>
+  <div class="footer">APIs: OpenTree (TNRS + induced subtree) & OneZoom (vernaculars). Pure client-side.</div>
 </div>
 
 <div id="tooltip" class="tooltip"></div>
@@ -77,8 +72,44 @@ const OT_BASE = "https://api.opentreeoflife.org/v3";
 const TNRS_URL = `${OT_BASE}/tnrs/match_names`;
 const INDUCED_URL = `${OT_BASE}/tree_of_life/induced_subtree`;
 const OZ_VERNACULAR_URL = "https://api.onezoom.org/vernacular_names.json"; // ?ott=<id>&lang=en
+const TXT_PATH = "extracted_species.txt"; // same folder as index.html
 
-const TXT_PATH = "extracted_species.txt"; // one sci name per line
+// Timeouts + retries
+const FETCH_TIMEOUT_MS = 9000;
+const RETRIES = 2;
+
+/* --------------------------
+   Net helpers with timeout/cache
+--------------------------- */
+const NET = document.getElementById("net");
+function setNet(s){ NET.textContent = s; }
+
+async function fetchJSON(url, opts = {}, bodyObj = null){
+  const attempt = async () => {
+    const ctrl = new AbortController();
+    const t = setTimeout(()=>ctrl.abort(), FETCH_TIMEOUT_MS);
+    try{
+      const resp = await fetch(url, {
+        method: bodyObj ? "POST" : (opts.method || "GET"),
+        headers: bodyObj ? {"Content-Type":"application/json", ...(opts.headers||{})} : (opts.headers||{}),
+        body: bodyObj ? JSON.stringify(bodyObj) : (opts.body || undefined),
+        signal: ctrl.signal,
+        cache: "no-store",
+        mode: "cors",
+        keepalive: false,
+      });
+      if(!resp.ok) throw new Error("HTTP "+resp.status);
+      return await resp.json();
+    } finally {
+      clearTimeout(t);
+    }
+  };
+  let lastErr;
+  for(let k=0;k<=RETRIES;k++){
+    try{ return await attempt(); }catch(e){ lastErr = e; }
+  }
+  throw lastErr;
+}
 
 /* --------------------------
    State
@@ -87,6 +118,12 @@ let LIST = [];           // [{sci}]
 let TARGET = null;       // {sci, ott, common}
 let GUESSES = [];        // [{sci, ott, common}]
 let turns = 0;
+
+// Caches
+const TNRS_CACHE = new Map();          // nameLower -> {ott,sci}
+const VERN_CACHE = new Map();          // ott -> common name or null
+const OTT2SCI = new Map();             // ott -> sci (from TNRS resolutions of target/guesses)
+const OTT2COMMON = new Map();          // ott -> common (lazy)
 
 function el(id){ return document.getElementById(id); }
 function setTurns(n){ turns = n; el("turns").textContent = `turns: ${turns}`; }
@@ -102,7 +139,6 @@ async function loadTxtList(){
     if(!r.ok) throw new Error("missing list");
     const text = await r.text();
     const lines = text.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
-    // lightweight sanity: Genus species...
     const genus = /[A-Z][a-zà-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ\-]*/.source;
     const epithet = /(?:×\s*)?[a-zà-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ\-]*/.source;
     const re = new RegExp(`^${genus}\\s+${epithet}(?:\\s+${epithet}){0,2}$`);
@@ -111,70 +147,65 @@ async function loadTxtList(){
       const k=s.toLowerCase(); if(seen.has(k)) return false; seen.add(k); return true;
     }).map(s=>({sci:s}));
     setPool(LIST.length);
-
     const dl = el("namelist");
-    for(const s of LIST.slice(0,1500)){ // keep datalist snappy
-      const o=document.createElement("option"); o.value=s.sci; dl.appendChild(o);
-    }
-  } catch {
-    setPool(0);
+    for(const s of LIST.slice(0,1500)){ const o=document.createElement("option"); o.value=s.sci; dl.appendChild(o); }
+  } catch { setPool(0); }
+}
+
+/* --------------------------
+   OpenTree / OneZoom helpers (cached)
+--------------------------- */
+async function tnrsResolve(name){
+  const key = name.toLowerCase();
+  if (TNRS_CACHE.has(key)) return TNRS_CACHE.get(key);
+  setNet("resolving…");
+  try{
+    const j = await fetchJSON(TNRS_URL, {}, { names:[name], do_approximate_matching:true });
+    const tax = j?.results?.[0]?.matches?.[0]?.taxon;
+    const out = (tax?.ott_id && tax?.name) ? { ott: tax.ott_id, sci: tax.name } : null;
+    TNRS_CACHE.set(key, out);
+    return out;
+  } finally {
+    setNet("idle");
+  }
+}
+
+async function vernacularEN(ott){
+  if (VERN_CACHE.has(ott)) return VERN_CACHE.get(ott);
+  setNet("vernacular…");
+  try{
+    const j = await fetchJSON(`${OZ_VERNACULAR_URL}?ott=${ott}&lang=en`);
+    const k = Object.keys(j)[0];
+    const out = (k && j[k]) ? j[k] : null;
+    VERN_CACHE.set(ott, out);
+    return out;
+  } finally {
+    setNet("idle");
   }
 }
 
 /* --------------------------
-   OpenTree / OneZoom helpers
---------------------------- */
-async function tnrsResolve(name){
-  try{
-    const r = await fetch(TNRS_URL, {
-      method:"POST", headers:{ "Content-Type":"application/json" },
-      body: JSON.stringify({ names:[name], do_approximate_matching:true })
-    });
-    if(!r.ok) return null;
-    const j = await r.json();
-    const t = j?.results?.[0]?.matches?.[0]?.taxon;
-    if(!t?.ott_id || !t?.name) return null;
-    return { ott:t.ott_id, sci:t.name };
-  }catch{ return null; }
-}
-
-async function vernacularEN(ott){
-  try{
-    const r = await fetch(`${OZ_VERNACULAR_URL}?ott=${ott}&lang=en`, {cache:"no-store"});
-    if(!r.ok) return null;
-    const j = await r.json();
-    const k = Object.keys(j)[0];
-    return (k && j[k]) ? j[k] : null;
-  }catch{ return null; }
-}
-
-/* --------------------------
-   Induced subtree (core)
+   Induced subtree (id labels)
 --------------------------- */
 async function inducedSubtree(ottIds){
-  // Ask for name_and_id so tips look like "Pan troglodytes_ott417950"
-  const body = { ott_ids: ottIds, label_format: "name_and_id" };
-  const r = await fetch(INDUCED_URL, {
-    method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body)
-  });
-  if(!r.ok) return null;
-  const j = await r.json();
-  return j?.newick || null;
+  setNet("tree…");
+  try{
+    const j = await fetchJSON(INDUCED_URL, {}, { ott_ids: ottIds, label_format: "id" }); // faster
+    return j?.newick || null;
+  } finally {
+    setNet("idle");
+  }
 }
 
 /* --------------------------
    Newick parser (minimal)
 --------------------------- */
 function parseNewick(s){
-  // returns a tree {children?, name?, label?}; labels are tip strings like "Homo sapiens_ott770315"
   let i = 0;
   function skipWS(){ while(/\s/.test(s[i])) i++; }
   function parseLabel(){
-    skipWS();
-    let lab = "";
-    while(i < s.length && !/[(),:;]/.test(s[i])){
-      lab += s[i++]; 
-    }
+    skipWS(); let lab = "";
+    while(i < s.length && !/[(),:;]/.test(s[i])) lab += s[i++];
     return lab.trim() || null;
   }
   function parseNode(){
@@ -189,7 +220,6 @@ function parseNewick(s){
         if(s[i] === ")"){ i++; break; }
         break;
       }
-      // optional internal label
       skipWS();
       const maybe = parseLabel();
       if(maybe) node.label = maybe;
@@ -197,25 +227,19 @@ function parseNewick(s){
       const lab = parseLabel();
       if(lab) node.label = lab;
     }
-    // ignore branch lengths
     skipWS();
     if(s[i] === ":"){ i++; while(i<s.length && !/[),;]/.test(s[i])) i++; }
     return node;
   }
-  const tree = parseNode();
-  return tree;
+  return parseNode();
 }
 
-// Extract ott from a "name_and_id" label like "Pan troglodytes_ott417950"
+// labels are just numbers with "ott" prefix or raw IDs depending on API; handle both
 function labelToOtt(label){
   if(!label) return null;
-  const m = label.match(/_ott(\d+)/);
+  // examples: "ott417950" or "417950"
+  const m = label.match(/(?:ott)?(\d+)/i);
   return m ? parseInt(m[1],10) : null;
-}
-function labelToSci(label){
-  if(!label) return label;
-  const m = label.match(/^(.*)_ott\d+$/);
-  return m ? m[1] : label;
 }
 
 /* --------------------------
@@ -229,13 +253,11 @@ const zoom = d3.zoom().scaleExtent([0.4, 3]).on("zoom", (ev)=> g.attr("transform
 svg.call(zoom);
 
 function buildHierarchy(n){
-  // Convert {children?, label?} to d3.hierarchy, and attach {ott, sci, isLeaf}
   function wrap(node){
     const children = node.children?.map(wrap) || null;
     const h = d3.hierarchy(node, d=>children);
     if(node.label){
       h.data.ott = labelToOtt(node.label);
-      h.data.sci = labelToSci(node.label);
     }
     return h;
   }
@@ -243,10 +265,9 @@ function buildHierarchy(n){
 }
 
 function treeLayoutAndFit(root){
-  const tree = d3.cluster().nodeSize([22, 140]); // vertical spacing, horizontal length per depth
+  const tree = d3.cluster().nodeSize([22, 140]);
   tree(root);
 
-  // draw links
   const link = linksG.selectAll("path").data(root.links(), d=>d.target.data.ott||Math.random());
   link.join(
     enter => enter.append("path").attr("class","link")
@@ -255,36 +276,32 @@ function treeLayoutAndFit(root){
     exit => exit.remove()
   );
 
-  // Draw leaf nodes with labels; internal nodes as dots (optional)
   const nodes = nodesG.selectAll("g.node").data(root.descendants(), d=>d.data.ott||d.depth+":"+d.x);
-  const nodesEnter = nodes.join(
+  nodes.join(
     enter => {
       const ng = enter.append("g").attr("class","node").attr("transform", d=>`translate(${d.y},${d.x})`);
-      // internal
-      ng.filter(d=>!d.children).classed("leaf", true);
+      const leaf = ng.filter(d=>!d.children).classed("leaf", true);
       ng.filter(d=>d.children).append("circle").attr("r",2);
-      // leaf labels
-      const leaf = ng.filter(d=>!d.children);
       leaf.append("text").attr("class","label").attr("x", 6).text(d=>{
         const isTarget = (d.data.ott === TARGET?.ott);
-        return isTarget ? "?" : (d.data.sci || "");
+        return isTarget ? "?" : (OTT2SCI.get(d.data.ott) || "");
       }).classed("target", d=>d.data.ott===TARGET?.ott);
-      leaf.append("text").attr("class","hint").attr("x", 6).attr("dy", "1.1em").text(d=>{
+      leaf.append("text").attr("class","hint").attr("x", 6).attr("dy","1.1em").text(d=>{
         const isTarget = (d.data.ott === TARGET?.ott);
         if(isTarget) return "";
-        return (findGuessByOtt(d.data.ott)?.common) || "";
+        return OTT2COMMON.get(d.data.ott) || "";
       });
       return ng;
     },
     update => update.attr("transform", d=>`translate(${d.y},${d.x})`)
       .select("text.label").text(d=>{
         const isTarget = (d.data.ott === TARGET?.ott);
-        return isTarget ? "?" : (d.data.sci || "");
+        return isTarget ? "?" : (OTT2SCI.get(d.data.ott) || "");
       }),
     exit => exit.remove()
   );
 
-  // Fit to content (leaves’ bbox + some padding)
+  // Fit view to content
   const all = root.descendants();
   const minX = d3.min(all, d=>d.x), maxX = d3.max(all, d=>d.x);
   const minY = d3.min(all, d=>d.y), maxY = d3.max(all, d=>d.y);
@@ -295,13 +312,13 @@ function treeLayoutAndFit(root){
   const s = Math.max(0.4, Math.min(2.5, Math.min(sx, sy)));
   const tx = (w - s*(minY+maxY))/2;
   const ty = (h - s*(minX+maxX))/2;
-  svg.transition().duration(500).call(zoom.transform, d3.zoomIdentity.translate(tx, ty).scale(s));
+  svg.transition().duration(400).call(zoom.transform, d3.zoomIdentity.translate(tx, ty).scale(s));
 }
 
 /* --------------------------
-   Tooltip for common names
+   Tooltip (optional hover)
 --------------------------- */
-const tip = el("tooltip");
+const tip = document.getElementById("tooltip");
 function showTip(html, x, y){ tip.innerHTML = html; tip.style.left = (x+12)+"px"; tip.style.top = (y+12)+"px"; tip.style.opacity = 1; }
 function hideTip(){ tip.style.opacity = 0; }
 
@@ -313,11 +330,12 @@ function pickRandom(){ return LIST[Math.floor(Math.random()*LIST.length)]?.sci |
 async function resolveOne(name){
   const tn = await tnrsResolve(name);
   if(!tn) return null;
-  const vn = await vernacularEN(tn.ott);
-  return { sci: tn.sci, ott: tn.ott, common: vn || null };
+  // cache sci + ott
+  OTT2SCI.set(tn.ott, tn.sci);
+  return { sci: tn.sci, ott: tn.ott, common: null }; // common added lazily
 }
 
-function findGuessByOtt(ott){ return GUESSES.find(g => g.ott === ott) || null; }
+function bumpTurn(){ setTurns(turns+1); }
 
 async function startNewGame(){
   setHint("choosing…");
@@ -326,25 +344,26 @@ async function startNewGame(){
   el("status").style.display = "none";
   el("guess").value = ""; el("guess").focus();
 
-  // Resolve a target from the list
+  // Resolve target (with retries)
   let t = null;
   for(let k=0;k<8 && !t;k++){
-    const cand = pickRandom();
-    t = await resolveOne(cand);
+    t = await resolveOne(pickRandom());
   }
-  if(!t){ // ultra fallback
-    t = await resolveOne("Opisthocomus hoazin");
-  }
+  if(!t){ t = await resolveOne("Opisthocomus hoazin"); }
   TARGET = t;
-  setHint(TARGET?.common ? TARGET.common : TARGET.sci);
+  setHint(OTT2SCI.get(TARGET.ott));
 
-  // Show the trivial tree with just "?" (target) and a placeholder until first real guess:
-  renderCurrentTree(); // at start, this will just show "?" alone
+  // kick off vernacular fetch in background (doesn't block)
+  vernacularEN(TARGET.ott).then(v=>{ if(v){ OTT2COMMON.set(TARGET.ott, v); } renderCurrentTree(); });
+
+  renderCurrentTree(); // initial "?"
 }
 
 async function submitGuess(){
   const raw = el("guess").value.trim();
   if(!raw) return;
+
+  // Resolve guess quickly (TNRS only; no vernacular yet)
   const resolved = await resolveOne(raw);
   if(!resolved){ bumpTurn(); return; }
 
@@ -354,61 +373,71 @@ async function submitGuess(){
   GUESSES.push(resolved);
   bumpTurn();
 
-  // If guessed the target, celebrate
+  // Target found
   if(resolved.ott === TARGET.ott){
     renderCurrentTree();
     const box = el("status");
     box.style.display = "block";
     box.innerHTML = `<div class="good">You found it in ${turns} turn${turns===1?"":"s"} 🎉</div>
-      <div><strong>Target:</strong> ${TARGET.common ? TARGET.common+" — " : ""}<span class="mono">${TARGET.sci}</span> (OTT ${TARGET.ott})</div>`;
-    el("guess").value=""; el("guess").focus(); return;
+      <div><strong>Target:</strong> ${OTT2COMMON.get(TARGET.ott) ? OTT2COMMON.get(TARGET.ott)+" — " : ""}<span class="mono">${OTT2SCI.get(TARGET.ott)}</span> (OTT ${TARGET.ott})</div>`;
+    el("guess").value=""; el("guess").focus(); 
+    // lazily fetch vernacular for the guessed one too
+    vernacularEN(resolved.ott).then(v=>{ if(v){ OTT2COMMON.set(resolved.ott, v); renderCurrentTree(); } });
+    return;
   }
 
-  // Otherwise, render the new induced subtree over {?, guesses}
+  // Render current partial tree; vernaculars fetched in background (non-blocking)
   renderCurrentTree();
+  vernacularEN(resolved.ott).then(v=>{ if(v){ OTT2COMMON.set(resolved.ott, v); renderCurrentTree(); } });
 
   el("guess").value=""; el("guess").focus();
 }
-
-function bumpTurn(){ setTurns(turns+1); }
 
 /* --------------------------
    Build + render the partial tree
 --------------------------- */
 async function renderCurrentTree(){
-  // If no guesses yet: render just a single leaf (?) so user sees "start"
+  // If no guesses yet, draw a single "?"
   if(GUESSES.length === 0){
-    // make a tiny fake two-leaf tree: (?, ?) collapsed -> just ?
-    // Simpler: clear drawing, draw a single "?" node centered
-    const w = svg.node().clientWidth, h = svg.node().clientHeight;
     linksG.selectAll("*").remove(); nodesG.selectAll("*").remove();
-    const root = {x:h/2,y:w/2};
+    const w = svg.node().clientWidth, h = svg.node().clientHeight;
     const ng = nodesG.append("g").attr("class","leaf").attr("transform", `translate(${w/2-30},${h/2})`);
-    ng.append("text").attr("class","label target").text("?").attr("font-size", "20px");
-    svg.call(zoom.transform, d3.zoomIdentity); // reset
+    ng.append("text").attr("class","label target").text("?").attr("font-size","20px");
+    svg.call(zoom.transform, d3.zoomIdentity);
     return;
   }
 
-  // Build the ott set: target + all guesses
   const otts = [TARGET.ott, ...GUESSES.map(g=>g.ott)];
-  const newick = await inducedSubtree(otts);
-  if(!newick){ console.warn("No newick"); return; }
+  let newick = null;
+  try{
+    document.body.classList.add("busy");
+    newick = await inducedSubtree(otts);
+  } catch(e){
+    document.body.classList.remove("busy");
+    console.warn("induced_subtree failed:", e);
+    // Soft error: show a toast-ish status
+    const box = el("status");
+    box.style.display = "block";
+    box.innerHTML = `<div class="bad">Network issue fetching subtree. Try the same guess again.</div>`;
+    return;
+  } finally {
+    document.body.classList.remove("busy");
+  }
+  if(!newick) return;
 
-  // Parse, build hierarchy, and render
+  // Parse & render
   const parsed = parseNewick(newick);
   const root = buildHierarchy(parsed);
 
-  // Attach a hover tooltip with common names for guessed leaves
-  nodesG.on("mousemove", null).on("mouseleave", null); // clear old handlers
+  // Hover tips for guessed leaves only (target just shows "Target")
   nodesG.on("mousemove", (ev)=>{
-    const tgt = d3.select(ev.target.parentNode).datum();
-    if(!tgt || tgt.children) return hideTip();
-    const isTarget = (tgt.data.ott === TARGET.ott);
-    if(isTarget) { showTip("<b>Target</b>", ev.clientX, ev.clientY); return; }
-    const g = findGuessByOtt(tgt.data.ott);
-    if(!g) return hideTip();
-    const common = g.common ? ` — <i>${g.common}</i>` : "";
-    showTip(`<b>${g.sci}</b>${common}`, ev.clientX, ev.clientY);
+    const d = d3.select(ev.target.parentNode).datum();
+    if(!d || d.children) return hideTip();
+    const isTarget = (d.data.ott === TARGET?.ott);
+    if(isTarget){ showTip("<b>Target</b>", ev.clientX, ev.clientY); return; }
+    const sci = OTT2SCI.get(d.data.ott) || "";
+    const common = OTT2COMMON.get(d.data.ott);
+    showTip(`<b>${sci}</b>${common ? " — <i>"+common+"</i>" : ""}`, ev.clientX, ev.clientY);
   }).on("mouseleave", hideTip);
 
   treeLayoutAndFit(root);
@@ -417,11 +446,10 @@ async function renderCurrentTree(){
 /* --------------------------
    Wire up UI + boot
 --------------------------- */
-el("submit").addEventListener("click", submitGuess);
-el("guess").addEventListener("keydown", e=>{ if(e.key==="Enter") submitGuess(); });
-el("newgame").addEventListener("click", startNewGame);
+document.getElementById("submit").addEventListener("click", submitGuess);
+document.getElementById("guess").addEventListener("keydown", e=>{ if(e.key==="Enter") submitGuess(); });
+document.getElementById("newgame").addEventListener("click", startNewGame);
 
-// boot
 loadTxtList().then(startNewGame);
 </script>
 </body>
