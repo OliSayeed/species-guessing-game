@@ -88,25 +88,27 @@ function initMaps(){
 
 function el(id){ return document.getElementById(id); }
 function setTurns(n){ el("turns").textContent = `turns: ${n}`; }
+function getTurns(){ return Number(el("turns").textContent.replace(/[^\d]/g,""))||0; }
 function setPool(n){ el("pool").textContent = `pool: ${n}`; }
 function setHint(t){ el("hint").textContent = t || ""; }
 
 /* ---------- LCA (binary lifting) ---------- */
-let up=null, depth=null;
+let up=null, depth=null, childrenAll=null;
 function buildLCA(){
   const n = TOPO.n, parent = TOPO.parent;
   depth = new Int32Array(n);
   const LOG = Math.ceil(Math.log2(Math.max(1,n)));
   up = Array.from({length:LOG+1}, ()=>new Int32Array(n).fill(-1));
 
-  // Build children list for a BFS from root to compute depths
-  const kids = Array.from({length:n}, ()=>[]);
-  for (let v=0; v<n; v++){ const p = parent[v]; if (p>=0) kids[p].push(v); }
+  // Precompute full-graph children once (used for faster subtree building)
+  childrenAll = Array.from({length:n}, ()=>[]);
+  for (let v=0; v<n; v++){ const p = parent[v]; if (p>=0) childrenAll[p].push(v); }
+
   const root = TOPO.root;
   const q = [root]; depth[root]=0; up[0][root] = -1;
   for(let qi=0; qi<q.length; qi++){
     const v = q[qi];
-    for (const w of kids[v]){ depth[w] = depth[v]+1; up[0][w] = v; q.push(w); }
+    for (const w of childrenAll[v]){ depth[w] = depth[v]+1; up[0][w] = v; q.push(w); }
   }
   for(let j=1;j<up.length;j++){
     for(let v=0; v<n; v++){
@@ -128,26 +130,21 @@ function lca(a,b){
 }
 
 /* ---------- Build minimal connecting subtree ---------- */
-function pathToRoot(v){
-  const p = TOPO.parent; const out = [];
-  while (v>=0){ out.push(v); v = p[v]; }
-  return out; // v..root
-}
 function minimalSubtreeFor(leafNodeIndices){
-  // union of paths + all their pairwise LCAs with target
+  // union of paths to root for all leaves
   const keep = new Set();
-  const addPath = (v)=>{ while(v>=0 && !keep.has(v)){ keep.add(v); v = TOPO.parent[v]; } };
-  for (const v of leafNodeIndices) addPath(v);
-  // compress: build children for kept nodes with only kept children
+  for (const start of leafNodeIndices){
+    let v = start;
+    while (v>=0 && !keep.has(v)){ keep.add(v); v = TOPO.parent[v]; }
+  }
+  // build active-children map restricted to kept nodes
   const children = new Map();
   for (const v of keep){
-    const ch = [];
-    for (let i=0;i<TOPO.n;i++){
-      if (TOPO.parent[i]===v && keep.has(i)) ch.push(i);
-    }
-    children.set(v, ch);
+    const chAll = childrenAll[v] || [];
+    const chKept = chAll.filter(c => keep.has(c));
+    children.set(v, chKept);
   }
-  // find display root = LCA of all leaves
+  // display root = LCA of all leaves (guaranteed kept)
   let root = leafNodeIndices[0];
   for (let i=1;i<leafNodeIndices.length;i++) root = lca(root, leafNodeIndices[i]);
   return { keep, children, root };
@@ -161,18 +158,23 @@ const nodesG = g.append("g").attr("class","nodes");
 const zoom = d3.zoom().scaleExtent([0.4, 3]).on("zoom", (ev)=> g.attr("transform", ev.transform));
 svg.call(zoom);
 
-function buildHierarchyFromKeep(keep, children, rootIdx){
+let ACTIVE = { keep:new Set(), children:new Map(), root:0 }; // current partial-tree structure
+
+function buildHierarchyFromKeep(active){
   // convert to a small hierarchy that d3.cluster can read
   const toNode = (idx)=>{
-    const node = { idx, children:[] };
-    const ch = children.get(idx) || [];
-    node.children = ch.map(toNode);
-    return node;
+    const childs = active.children.get(idx) || [];
+    return { idx, children: childs.map(toNode) };
   };
-  return d3.hierarchy(toNode(rootIdx), d=>d.children);
+  return d3.hierarchy(toNode(active.root), d=>d.children);
 }
 
-function treeLayoutAndFit(root, isTargetLeaf){
+function activeChildrenCount(idx){
+  const ch = ACTIVE.children.get(idx);
+  return ch ? ch.length : 0;
+}
+
+function treeLayoutAndFit(root){
   const tree = d3.cluster().nodeSize([22, 140]);
   tree(root);
 
@@ -188,14 +190,15 @@ function treeLayoutAndFit(root, isTargetLeaf){
   nodes.join(
     enter => {
       const ng = enter.append("g").attr("class","node").attr("transform", d=>`translate(${d.y},${d.x})`);
-      const lc = ng.filter(d=> (childrenCount(d.data.idx)===0) ).classed("leaf", true);
-      ng.filter(d=>childrenCount(d.data.idx)>0).append("circle").attr("r",2);
-      lc.append("text").attr("class","label").attr("x",6).text(d=>{
+      const isLeafSel = ng.filter(d=> activeChildrenCount(d.data.idx)===0 ).classed("leaf", true);
+      ng.filter(d=> activeChildrenCount(d.data.idx)>0 ).append("circle").attr("r",2);
+      // labels for leaves in the ACTIVE subtree
+      isLeafSel.append("text").attr("class","label").attr("x",6).text(d=>{
         const ott = TOPO.index_ott[d.data.idx];
         if (ott === TARGET.ott) return "?";
         return ott2sci.get(ott) || "";
       }).classed("target", d=>TOPO.index_ott[d.data.idx]===TARGET.ott);
-      lc.append("text").attr("class","hint").attr("x",6).attr("dy","1.1em").text(d=>{
+      isLeafSel.append("text").attr("class","hint").attr("x",6).attr("dy","1.1em").text(d=>{
         const ott = TOPO.index_ott[d.data.idx];
         if (ott === TARGET.ott) return "";
         return ott2common.get(ott) || "";
@@ -223,12 +226,6 @@ function treeLayoutAndFit(root, isTargetLeaf){
   const tx = (w - s*(minY+maxY))/2;
   const ty = (h - s*(minX+maxX))/2;
   svg.transition().duration(400).call(zoom.transform, d3.zoomIdentity.translate(tx, ty).scale(s));
-}
-
-function childrenCount(v){
-  let c = 0;
-  for (let i=0;i<TOPO.n;i++) if (TOPO.parent[i]===v) c++;
-  return c;
 }
 
 /* ---------- Game state ---------- */
@@ -265,18 +262,21 @@ function renderInitial(){
 
 function renderPartial(){
   if (GUESSES.length===0){ renderInitial(); return; }
+
   // node indices for leaves in play (target + all guessed)
   const indices = [];
   const targetIdx = TOPO.ott_index[String(TARGET.ott)];
+  if (targetIdx==null) return;
   indices.push(targetIdx);
   for (const g of GUESSES){
     const idx = TOPO.ott_index[String(g.ott)];
     if (idx!=null) indices.push(idx);
   }
-  // build minimal subtree
-  // include LCAs pairwise with target automatically via path union
-  const ms = minimalSubtreeFor(indices);
-  const h = buildHierarchyFromKeep(ms.keep, ms.children, ms.root);
+
+  // Build minimal subtree and keep it globally for leaf detection
+  ACTIVE = minimalSubtreeFor(indices);
+
+  const h = buildHierarchyFromKeep(ACTIVE);
   treeLayoutAndFit(h);
 }
 
@@ -294,7 +294,8 @@ function submitGuess(){
   const raw = document.getElementById("guess").value.trim();
   if (!raw) return;
   const ott = name2ott.get(raw.toLowerCase());
-  setTurns(parseInt(document.getElementById("turns").textContent.replace(/\D+/g,""))+1);
+  setTurns(getTurns()+1);
+
   if (!ott){ // unrecognized
     const box = document.getElementById("status");
     box.style.display = "block";
@@ -311,7 +312,7 @@ function submitGuess(){
     const box = document.getElementById("status");
     box.style.display = "block";
     const cn = ott2common.get(TARGET.ott);
-    box.innerHTML = `<div class="good">You found it in ${document.getElementById("turns").textContent.split(": ")[1]} 🎉</div>
+    box.innerHTML = `<div class="good">You found it in ${getTurns()} turn${getTurns()===1?"":"s"} 🎉</div>
       <div><strong>Target:</strong> ${cn ? cn+" — " : ""}<span class="mono">${ott2sci.get(TARGET.ott)}</span> (OTT ${TARGET.ott})</div>`;
     resetUI();
     return;
