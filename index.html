@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Species Guessing Game — Simple Mode</title>
+  <title>Species Guessing Game — Simple Distance Mode</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     :root { --card:#fff; --ink:#111; --muted:#666; --line:#e5e7eb; --good:#0a7d25; --bad:#a60d0d; }
@@ -24,18 +24,19 @@
     .small{font-size:14px}
     .footer{margin-top:28px;color:var(--muted);font-size:14px}
     .chip{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:2px 8px;margin-left:6px;font-size:12px;color:#444}
+    .net{font-size:12px;color:#555}
   </style>
 </head>
 <body>
 <div class="wrap">
   <h1>Species Guessing Game</h1>
-  <p class="muted">No visuals, just signal: after each guess I show the tree <em>distance</em> to the secret target. Smaller = closer. Distance 0 = correct 🎯</p>
+  <p class="muted">After each guess I show the taxonomy-tree <em>distance</em> to the secret target (smaller = closer). Distance 0 = correct 🎯</p>
 
   <div class="row">
     <button id="newgame">New game</button>
     <span id="turns" class="pill">turns: 0</span>
-    <span id="pool" class="pill small">pool: …</span>
     <span id="hint" class="pill small"></span>
+    <span id="net" class="net">idle</span>
   </div>
 
   <div class="row">
@@ -56,95 +57,110 @@
     <div id="log" class="list"></div>
   </div>
 
-  <div class="footer">Runs entirely locally using <code>species_pack.json</code> + <code>tree_topology.json</code>. No network during play.</div>
+  <div class="footer">Uses OpenTree TNRS + Taxonomy (lineages). No big tree downloads.</div>
 </div>
 
 <script>
 /* --------------------------
-   Load precomputed data
+   Config
 --------------------------- */
-let PACK=null, TOPO=null;
+const OT = "https://api.opentreeoflife.org/v3";
+const TNRS = `${OT}/tnrs/match_names`;
+const TAXON_INFO = `${OT}/taxonomy/taxon_info`;
+const TXT_PATH = "extracted_species.txt"; // optional; used only for the datalist
 
-async function loadJSON(path){
-  const r = await fetch(path, {cache:"no-store"});
-  if (!r.ok) throw new Error(`Failed to load ${path}`);
-  return r.json();
+const NET = document.getElementById("net");
+function net(s){ NET.textContent = s; }
+
+/* --------------------------
+   Net helper (timeout + retries)
+--------------------------- */
+const TIMEOUT = 9000, RETRIES = 2;
+async function fetchJSON(url, body=null){
+  const attempt = async ()=>{
+    const ctrl = new AbortController();
+    const t = setTimeout(()=>ctrl.abort(), TIMEOUT);
+    try{
+      const resp = await fetch(url,{
+        method: body ? "POST":"GET",
+        headers: body ? {"Content-Type":"application/json"} : undefined,
+        body: body ? JSON.stringify(body) : undefined,
+        signal: ctrl.signal,
+        cache: "no-store",
+        mode: "cors",
+      });
+      if(!resp.ok) throw new Error("HTTP "+resp.status);
+      return await resp.json();
+    } finally { clearTimeout(t); }
+  };
+  let err;
+  for(let k=0;k<=RETRIES;k++){
+    try{ return await attempt(); }catch(e){ err=e; }
+  }
+  throw err;
 }
 
 /* --------------------------
-   Maps & indexes
+   Caches
 --------------------------- */
-const name2ott = new Map(); // lowercased sci or common -> ott
-const ott2sci = new Map();
-const ott2common = new Map();
-
-function initMaps(){
-  for (const [k,v] of Object.entries(PACK.name_to_ott)) name2ott.set(k, v);
-  for (const sp of PACK.species){
-    ott2sci.set(sp.ott, sp.sci);
-    if (sp.common){
-      ott2common.set(sp.ott, sp.common);
-    }
-  }
-}
+const TNRS_CACHE = new Map();     // key: nameLower -> {ott,sci} or null
+const LINEAGE_CACHE = new Map();  // key: ott -> [{name,ott}, tip→root]
+const COMMON_CACHE = new Map();   // key: sci(lower) -> best-known common (from TNRS synonym field if exposed)
 
 /* --------------------------
-   LCA & distance (binary lifting)
+   Helpers
 --------------------------- */
-let depth=null, up=null, childrenAll=null;
-
-function buildLCA(){
-  const n = TOPO.n, parent = TOPO.parent;
-  depth = new Int32Array(n);
-  const LOG = Math.ceil(Math.log2(Math.max(1,n)));
-  up = Array.from({length:LOG+1}, ()=>new Int32Array(n).fill(-1));
-
-  // children list for BFS
-  childrenAll = Array.from({length:n}, ()=>[]);
-  for (let v=0; v<n; v++){
-    const p = parent[v];
-    if (p>=0) childrenAll[p].push(v);
-  }
-  const root = TOPO.root;
-  const q = [root];
-  depth[root] = 0;
-  up[0][root] = -1;
-
-  for (let i=0; i<q.length; i++){
-    const v = q[i];
-    for (const w of childrenAll[v]){
-      depth[w] = depth[v] + 1;
-      up[0][w] = v;
-      q.push(w);
-    }
-  }
-  for (let j=1; j<up.length; j++){
-    for (let v=0; v<n; v++){
-      const mid = up[j-1][v];
-      up[j][v] = (mid>=0 ? up[j-1][mid] : -1);
-    }
-  }
+async function tnrs(name){
+  const key = name.toLowerCase();
+  if (TNRS_CACHE.has(key)) return TNRS_CACHE.get(key);
+  net("resolving…");
+  try{
+    const j = await fetchJSON(TNRS, { names:[name], do_approximate_matching:true });
+    const t = j?.results?.[0]?.matches?.[0]?.taxon;
+    if (!t?.ott_id || !t?.name){ TNRS_CACHE.set(key,null); return null; }
+    const out = { ott: t.ott_id, sci: t.name };
+    TNRS_CACHE.set(key, out);
+    return out;
+  } finally { net("idle"); }
 }
 
-function lca(a,b){
-  if (a===b) return a;
-  if (depth[a] < depth[b]) [a,b] = [b,a];
-  let diff = depth[a] - depth[b];
-  for (let j=0; diff>0; j++, diff>>=1){ if (diff&1) a = up[j][a]; }
-  if (a===b) return a;
-  for (let j=up.length-1; j>=0; j--){
-    if (up[j][a] !== up[j][b]){ a = up[j][a]; b = up[j][b]; }
-  }
-  return up[0][a];
+async function lineage(ott){
+  if (LINEAGE_CACHE.has(ott)) return LINEAGE_CACHE.get(ott);
+  net("lineage…");
+  try{
+    const j = await fetchJSON(TAXON_INFO, { ott_id: ott, include_lineage: true });
+    // normalize to tip→root, drop true roots
+    let arr = Array.isArray(j.lineage) ? j.lineage.slice() : [];
+    // If first entry looks like root, reverse
+    if (arr.length && (arr[0].ott_id===805080 || (arr[0].name||"").toLowerCase()==="life")) arr = arr.reverse();
+    const clean = arr.filter(a=>{
+      const nm = (a.name||"").toLowerCase();
+      return a.ott_id !== 805080 && nm !== "life" && nm !== "cellular organisms";
+    }).map(a => ({name: a.name||"", ott: a.ott_id||null}));
+    LINEAGE_CACHE.set(ott, clean);
+    return clean;
+  } finally { net("idle"); }
 }
 
-function distByOtt(ottA, ottB){
-  if (ottA === ottB) return 0;
-  const idxA = TOPO.ott_index[String(ottA)];
-  const idxB = TOPO.ott_index[String(ottB)];
-  if (idxA==null || idxB==null) return Infinity;
-  const c = lca(idxA, idxB);
-  return (depth[idxA] + depth[idxB] - 2*depth[c]);
+// taxonomy distance via lineage intersection (nearest shared ancestor)
+async function taxonomyDistance(ottA, ottB){
+  if (ottA===ottB) return 0;
+  const la = await lineage(ottA);
+  const lb = await lineage(ottB);
+  if (!la.length || !lb.length) return Infinity;
+
+  const posB = new Map(); // ott -> index (steps from A tip/root orientation handled by clean)
+  for (let i=0;i<lb.length;i++) if (lb[i].ott) posB.set(lb[i].ott, i);
+
+  // la and lb are tip→root without root; index is steps upward from tip
+  for (let i=0;i<la.length;i++){
+    const id = la[i].ott;
+    if (id && posB.has(id)){
+      const j = posB.get(id);
+      return i + j; // i steps from A to shared, j from B to shared
+    }
+  }
+  return Infinity;
 }
 
 /* --------------------------
@@ -153,127 +169,124 @@ function distByOtt(ottA, ottB){
 function el(id){ return document.getElementById(id); }
 function setTurns(n){ el("turns").textContent = `turns: ${n}`; }
 function getTurns(){ return Number(el("turns").textContent.replace(/[^\d]/g,""))||0; }
-function setPool(n){ el("pool").textContent = `pool: ${n}`; }
 function setHint(t){ el("hint").textContent = t || ""; }
-function resetUI(){ el("status").style.display="none"; el("guess").value=""; el("guess").focus(); }
+function showStatus(html, kind="bad"){
+  const box = el("status");
+  box.style.display = "block";
+  box.innerHTML = `<div class="${kind}">${html}</div>`;
+}
+function clearStatus(){ el("status").style.display = "none"; }
 
-function fmtSpecies(ott){
-  const sci = ott2sci.get(ott) || `OTT ${ott}`;
-  const cn = ott2common.get(ott);
-  return cn ? `${sci} <span class="chip">${cn}</span>` : sci;
+/* --------------------------
+   Datalist (optional)
+--------------------------- */
+async function loadNamesFile(){
+  try{
+    const r = await fetch(TXT_PATH, {cache:"no-store"});
+    if (!r.ok) return;
+    const text = await r.text();
+    const lines = text.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+    const genus = /[A-Z][a-zà-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ\-]*/.source;
+    const epithet = /(?:×\s*)?[a-zà-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ\-]*/.source;
+    const re = new RegExp(`^${genus}\\s+${epithet}(?:\\s+${epithet}){0,2}$`);
+    const names = lines.filter(s=>re.test(s)).slice(0,2500);
+    const dl = el("names");
+    for (const n of names){ const o=document.createElement("option"); o.value=n; dl.appendChild(o); }
+  }catch{}
 }
 
 /* --------------------------
    Game state
 --------------------------- */
-let TARGET=null;   // {ott}
-let GUESSES=[];    // [{ott, dist}]
+let TARGET=null;   // {ott, sci}
+let GUESSES=[];    // [{ott, sci, dist}]
+function fmtSpecies(sci){ return sci; } // keep it simple for now
 
-function pickRandomOTT(){
-  const arr = PACK.species;
-  const r = arr[Math.floor(Math.random()*arr.length)];
-  return r.ott;
+async function pickRandomTarget(){
+  // sample a few random names from the optional list or fallback
+  const fallback = ["Opisthocomus hoazin","Loxodonta africana","Zea mays","Iguana iguana","Pan troglodytes","Gadus morhua"];
+  let name = fallback[Math.floor(Math.random()*fallback.length)];
+  try{
+    const r = await fetch(TXT_PATH, {cache:"no-store"});
+    if (r.ok){
+      const txt = await r.text();
+      const arr = txt.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+      const genus = /[A-Z][a-zà-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ\-]*/.source;
+      const epithet = /(?:×\s*)?[a-zà-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ\-]*/.source;
+      const re = new RegExp(`^${genus}\\s+${epithet}(?:\\s+${epithet}){0,2}$`);
+      const valids = arr.filter(s=>re.test(s));
+      if (valids.length) name = valids[Math.floor(Math.random()*valids.length)];
+    }
+  }catch{}
+  const t = await tnrs(name);
+  return t || await tnrs("Opisthocomus hoazin");
 }
 
-function updateDatalist(){
-  const dl = el("names"); dl.innerHTML = "";
-  const names = [];
-  for (const sp of PACK.species){ names.push(sp.sci); if (sp.common) names.push(sp.common); }
-  for (const v of names.slice(0, 2500)){ const o=document.createElement("option"); o.value=v; dl.appendChild(o); }
-}
-
-/* --------------------------
-   Rendering
---------------------------- */
-function renderClosest(){
-  if (!GUESSES.length){ el("closest").textContent = "None yet — make a guess."; return; }
-  const best = GUESSES.reduce((a,b)=> a.dist<=b.dist ? a : b);
-  el("closest").innerHTML = `
-    <div><strong>${fmtSpecies(best.ott)}</strong></div>
-    <div>distance to target: <span class="mono">${best.dist}</span></div>
-  `;
-}
-
-function renderLog(){
-  const box = el("log"); box.innerHTML = "";
-  for (const g of [...GUESSES].reverse()){
-    const row = document.createElement("div");
-    row.className = "card small";
-    row.innerHTML = `
-      <div><strong>${fmtSpecies(g.ott)}</strong></div>
-      <div>distance: <span class="mono">${g.dist}</span></div>
-    `;
-    box.appendChild(row);
-  }
+async function newGame(){
+  setTurns(0); GUESSES = []; clearStatus();
+  TARGET = await pickRandomTarget();
+  setHint(TARGET?.sci || "");
+  el("closest").textContent = "None yet — make a guess.";
+  el("log").innerHTML = "";
+  el("guess").value = ""; el("guess").focus();
 }
 
 /* --------------------------
    Actions
 --------------------------- */
-function newGame(){
-  setTurns(0);
-  GUESSES.length = 0;
-  TARGET = { ott: pickRandomOTT() };
-  setHint(ott2sci.get(TARGET.ott));  // optional: shows the target sci name as a hint
-  resetUI();
-  renderClosest();
-  renderLog();
-}
-
-function submitGuess(){
+async function submitGuess(){
   const raw = el("guess").value.trim();
   if (!raw) return;
-
-  const ott = name2ott.get(raw.toLowerCase());
+  clearStatus();
   setTurns(getTurns()+1);
 
-  if (!ott){
-    const box = el("status");
-    box.style.display = "block";
-    box.innerHTML = `<div class="bad">Not recognized: <span class="mono">${raw}</span></div>`;
-    resetUI();
-    return;
+  const t = await tnrs(raw);
+  if (!t){
+    showStatus(`Not recognized: <span class="mono">${raw}</span>`, "bad");
+    el("guess").value = ""; el("guess").focus(); return;
   }
 
-  // duplicates ignored
-  if (GUESSES.some(g=>g.ott===ott)){ resetUI(); return; }
+  // ignore duplicates
+  if (GUESSES.some(g=>g.ott===t.ott)){ el("guess").value=""; el("guess").focus(); return; }
 
-  const d = distByOtt(ott, TARGET.ott);
-  GUESSES.push({ ott, dist: d });
+  const d = await taxonomyDistance(t.ott, TARGET.ott);
+  GUESSES.push({ ott:t.ott, sci:t.sci, dist:d });
 
+  // Win?
   if (d === 0){
-    renderClosest();
-    renderLog();
+    el("closest").innerHTML = `<div><strong>${fmtSpecies(t.sci)}</strong></div>
+      <div>distance to target: <span class="mono">0</span></div>`;
     const box = el("status");
     box.style.display = "block";
     box.innerHTML = `<div class="good">You found it in ${getTurns()} turn${getTurns()===1?"":"s"} 🎉</div>
-      <div><strong>Target:</strong> ${fmtSpecies(TARGET.ott)}</div>`;
-    resetUI();
-    return;
+      <div><strong>Target:</strong> <span class="mono">${TARGET.sci}</span></div>`;
+    el("guess").value = ""; el("guess").focus(); return;
   }
 
-  renderClosest();
-  renderLog();
-  resetUI();
+  // Update “closest so far”
+  const best = GUESSES.reduce((a,b)=> a.dist<=b.dist ? a : b);
+  el("closest").innerHTML = `
+    <div><strong>${fmtSpecies(best.sci)}</strong></div>
+    <div>distance to target: <span class="mono">${best.dist}</span></div>
+  `;
+
+  // Log
+  const row = document.createElement("div");
+  row.className = "card small";
+  row.innerHTML = `<div><strong>${fmtSpecies(t.sci)}</strong></div>
+                   <div>distance: <span class="mono">${d}</span></div>`;
+  el("log").prepend(row);
+
+  el("guess").value = ""; el("guess").focus();
 }
 
 /* --------------------------
    Boot
 --------------------------- */
-(async function(){
-  // Load precomputed packs (must be next to index.html)
-  PACK = await loadJSON("species_pack.json");
-  TOPO = await loadJSON("tree_topology.json");
-  initMaps();
-  buildLCA();
-  setPool(PACK.species.length);
-  updateDatalist();
-  newGame();
-})();
-
-document.getElementById("submit").addEventListener("click", submitGuess);
-document.getElementById("guess").addEventListener("keydown", e=>{ if (e.key==="Enter") submitGuess(); });
-document.getElementById("newgame").addEventListener("click", newGame);
+document.getElementById("submit").addEventListener("click", ()=>submitGuess().catch(e=>showStatus("Network hiccup — try again", "bad")));
+document.getElementById("guess").addEventListener("keydown", e=>{ if (e.key==="Enter") submitGuess().catch(()=>{}); });
+document.getElementById("newgame").addEventListener("click", ()=>newGame().catch(()=>{}));
+loadNamesFile().then(newGame);
 </script>
 </body>
 </html>
