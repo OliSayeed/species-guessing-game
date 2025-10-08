@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Precompute OpenTree pack (no installs)</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root{--line:#e5e7eb;--ink:#111;--muted:#666;}
+  body{font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:24px;color:var(--ink)}
+  h1{margin:0 0 6px}
+  .muted{color:var(--muted)}
+  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:12px 0}
+  button{padding:10px 14px;border:1px solid var(--line);border-radius:10px;background:#fff;cursor:pointer}
+  button:hover{background:#f3f4f6}
+  progress{width:320px;height:10px}
+  pre{background:#fff;border:1px solid var(--line);border-radius:10px;padding:10px;max-height:280px;overflow:auto}
+  .ok{color:#0a7d25;font-weight:600}
+  .warn{color:#a60d0d;font-weight:600}
+</style>
+</head>
+<body>
+<h1>Precompute OpenTree pack</h1>
+<p class="muted">Reads <code>extracted_species.txt</code>, resolves OTT ids & common names, downloads the induced subtree, and exports two JSON files for the game.</p>
+
+<div class="row">
+  <label>Species text file:
+    <input id="file" type="file" accept=".txt">
+  </label>
+  <button id="start">Start precompute</button>
+</div>
+
+<div class="row">
+  <span>Progress:</span><progress id="prog" value="0" max="1"></progress>
+  <span id="status" class="muted">idle</span>
+</div>
+
+<pre id="log"></pre>
+
+<script>
+const TNRS_URL = "https://api.opentreeoflife.org/v3/tnrs/match_names";
+const INDUCED_URL = "https://api.opentreeoflife.org/v3/tree_of_life/induced_subtree";
+const OZ_VERN = "https://api.onezoom.org/vernacular_names.json"; // ?ott=<id>&lang=en
+
+const logEl = document.getElementById("log");
+const statusEl = document.getElementById("status");
+const prog = document.getElementById("prog");
+const startBtn = document.getElementById("start");
+const fileInp = document.getElementById("file");
+
+function log(msg){ logEl.textContent += msg + "\n"; logEl.scrollTop = logEl.scrollHeight; }
+function setStatus(s){ statusEl.textContent = s; }
+function saveJSON(obj, name){
+  const blob = new Blob([JSON.stringify(obj)], {type:"application/json"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+async function fetchJSON(url, body=null){
+  const ctrl = new AbortController();
+  const t = setTimeout(()=>ctrl.abort(), 12000);
+  try{
+    const r = await fetch(url, {
+      method: body ? "POST":"GET",
+      headers: body ? {"Content-Type":"application/json"} : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+      signal: ctrl.signal,
+      cache: "no-store"
+    });
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    return await r.json();
+  } finally { clearTimeout(t); }
+}
+
+function parseLines(text){
+  const genus = /[A-Z][a-zà-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ\-]*/.source;
+  const epithet = /(?:×\s*)?[a-zà-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ\-]*/.source;
+  const re = new RegExp(`^${genus}\\s+${epithet}(?:\\s+${epithet}){0,2}$`);
+  const seen = new Set();
+  return text.split(/\r?\n/)
+    .map(s=>s.trim()).filter(Boolean)
+    .filter(s=>re.test(s))
+    .filter(s=>{ const k=s.toLowerCase(); if(seen.has(k)) return false; seen.add(k); return true; });
+}
+
+async function tnrsBatch(names, chunk=50, pauseMs=250){
+  const out = new Map();
+  for(let i=0;i<names.length;i+=chunk){
+    const batch = names.slice(i, i+chunk);
+    setStatus(`TNRS ${i+1}-${Math.min(i+batch.length,names.length)} / ${names.length}`);
+    const j = await fetchJSON(TNRS_URL, { names: batch, do_approximate_matching: true });
+    for (let k=0;k<batch.length;k++){
+      const res = j?.results?.[k]?.matches?.[0]?.taxon;
+      if(res?.ott_id && res?.name){ out.set(batch[k], {ott:res.ott_id, sci:res.name}); }
+    }
+    prog.value = (i+batch.length)/names.length;
+    await new Promise(r=>setTimeout(r,pauseMs));
+  }
+  return out;
+}
+
+async function vernacularBatch(otts, chunk=80, pauseMs=200){
+  const out = new Map();
+  for(let i=0;i<otts.length;i+=chunk){
+    setStatus(`Vernacular ${i+1}-${Math.min(i+chunk,otts.length)} / ${otts.length}`);
+    const slice = otts.slice(i,i+chunk);
+    // fetch sequentially inside chunk to avoid hammering; OneZoom is lightweight
+    for (const id of slice){
+      try{
+        const j = await fetchJSON(`${OZ_VERN}?ott=${id}&lang=en`);
+        const k = Object.keys(j)[0];
+        if (k && j[k]) out.set(id, j[k]);
+      }catch{}
+    }
+    prog.value = (i+slice.length)/otts.length;
+    await new Promise(r=>setTimeout(r,pauseMs));
+  }
+  return out;
+}
+
+function newickParse(s){
+  let i=0;
+  function skip(){ while(/\s/.test(s[i])) i++; }
+  function label(){ skip(); let t=""; while(i<s.length && !/[(),:;]/.test(s[i])) t+=s[i++]; return t.trim()||null; }
+  function node(){
+    skip();
+    const n={};
+    if(s[i]==="("){
+      i++; n.children=[];
+      while(true){
+        n.children.push(node()); skip();
+        if(s[i]===","){ i++; continue; }
+        if(s[i]===")"){ i++; break; }
+        break;
+      }
+      skip(); const lab=label(); if(lab) n.label=lab;
+    } else {
+      const lab=label(); if(lab) n.label=lab;
+    }
+    skip(); if(s[i]===":"){ i++; while(i<s.length && !/[),;]/.test(s[i])) i++; }
+    return n;
+  }
+  return node();
+}
+function labelToOtt(l){ const m = (l||"").match(/(?:ott)?(\d+)/i); return m ? parseInt(m[1],10) : null; }
+
+function buildTopologyFromNewick(nw){
+  const root = newickParse(nw);
+  const nodes = [];
+  const parent = [];
+  const index_ott = [];
+  const ott_index = new Map();
+
+  function dfs(node, p){
+    const idx = nodes.length;
+    nodes.push(node);
+    parent[idx] = (p==null ? -1 : p);
+    const ott = node.label ? labelToOtt(node.label) : null;
+    index_ott[idx] = ott;
+    if (ott != null) ott_index.set(ott, idx);
+    if (node.children) {
+      for (const ch of node.children) dfs(ch, idx);
+    }
+  }
+  dfs(root, null);
+  // convert map
+  const ott_index_obj = Object.fromEntries(ott_index.entries());
+  return { n: nodes.length, root: 0, parent, index_ott, ott_index: ott_index_obj };
+}
+
+async function run(){
+  const file = fileInp.files?.[0];
+  if(!file){ alert("Choose extracted_species.txt"); return; }
+  const text = await file.text();
+  const names = parseLines(text);
+  log(`Read ${names.length} candidate names`);
+
+  // 1) TNRS all names
+  prog.value = 0; prog.max = 1; setStatus("TNRS…");
+  const tnrsMap = await tnrsBatch(names);
+  log(`TNRS mapped ${tnrsMap.size}/${names.length}`);
+
+  // 2) Build species list and name_to_ott map (include sci + common keys later)
+  const species = [];
+  const name_to_ott = {};
+  for (const [raw, v] of tnrsMap.entries()){
+    species.push({ ott: v.ott, sci: v.sci, common: null });
+    name_to_ott[v.sci.toLowerCase()] = v.ott;
+  }
+
+  // 3) Vernaculars (optional but nice)
+  const otts = species.map(s=>s.ott);
+  prog.value = 0; prog.max = 1; setStatus("Vernaculars…");
+  const vern = await vernacularBatch(otts);
+  let withCommon = 0;
+  for (const sp of species){
+    const cn = vern.get(sp.ott) || null;
+    if (cn){ sp.common = cn; name_to_ott[cn.toLowerCase()] = sp.ott; withCommon++; }
+  }
+  log(`Common names found for ${withCommon}/${species.length}`);
+
+  // 4) Induced subtree for whole pool
+  setStatus("Induced subtree… (one call)");
+  const j = await fetchJSON(INDUCED_URL, { ott_ids: otts, label_format: "id" });
+  const newick = j?.newick;
+  if (!newick) { log("No Newick returned."); throw new Error("induced_subtree failed"); }
+
+  // 5) Build compact topology
+  setStatus("Building topology…");
+  const topo = buildTopologyFromNewick(newick);
+
+  // 6) Save files
+  setStatus("Saving files…");
+  saveJSON({ version:1, species, name_to_ott }, "species_pack.json");
+  saveJSON({ version:1, ...topo }, "tree_topology.json");
+
+  setStatus("Done ✅"); log("All done. Put both JSON files next to index.html");
+}
+
+document.getElementById("start").onclick = ()=>run().catch(e=>{
+  setStatus("Error"); log("ERROR: "+e.message+"\n"+String(e.stack||""));
+});
+</script>
+</body>
+</html>
