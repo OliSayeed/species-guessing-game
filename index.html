@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Species Guessing Game — Partial Tree (Fast)</title>
+  <title>Species Guessing Game — Offline Partial Tree</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
   <style>
@@ -31,24 +31,22 @@
     .leaf .label.target{font-weight:700}
     .leaf .hint{fill:#666;font-size:12px}
     .tooltip{position:fixed;pointer-events:none;background:#111;color:#fff;padding:6px 8px;border-radius:8px;font-size:12px;opacity:0;transition:opacity .12s ease;}
-    .busy{opacity:.6}
   </style>
 </head>
 <body>
 <div class="wrap">
   <h1>Species Guessing Game</h1>
-  <p class="muted">We reveal just the part of the tree needed to compare your guesses with the secret target. Leaves are your guesses; the target is <strong>?</strong>. The view auto-zooms to the relevant clade.</p>
+  <p class="muted">All local: we render just the part of the tree needed to compare your guesses with the secret target. Leaves show scientific names; the target is <strong>?</strong>. Hover for common names.</p>
 
   <div class="row section">
     <button id="newgame">New game</button>
     <span id="turns" class="pill">turns: 0</span>
     <span id="pool" class="pill small">pool: …</span>
     <span id="hint" class="pill small"></span>
-    <span id="net" class="pill small">idle</span>
   </div>
 
   <div class="row section">
-    <input id="guess" type="text" list="namelist" placeholder="Type a scientific name (e.g., Opisthocomus hoazin)" />
+    <input id="guess" type="text" list="namelist" placeholder="Type a scientific or common name" />
     <datalist id="namelist"></datalist>
     <button id="submit">Guess</button>
   </div>
@@ -59,192 +57,103 @@
 
   <div id="status" class="card section" style="display:none;"></div>
 
-  <div class="footer">APIs: OpenTree (TNRS + induced subtree) & OneZoom (vernaculars). Pure client-side.</div>
+  <div class="footer">Precomputed with OpenTree/OneZoom. No network during play.</div>
 </div>
 
 <div id="tooltip" class="tooltip"></div>
 
 <script>
-/* --------------------------
-   Config & Endpoints
---------------------------- */
-const OT_BASE = "https://api.opentreeoflife.org/v3";
-const TNRS_URL = `${OT_BASE}/tnrs/match_names`;
-const INDUCED_URL = `${OT_BASE}/tree_of_life/induced_subtree`;
-const OZ_VERNACULAR_URL = "https://api.onezoom.org/vernacular_names.json"; // ?ott=<id>&lang=en
-const TXT_PATH = "extracted_species.txt"; // same folder as index.html
+/* ---------- Load precomputed packs ---------- */
+let PACK=null, TOPO=null;
 
-// Timeouts + retries
-const FETCH_TIMEOUT_MS = 9000;
-const RETRIES = 2;
-
-/* --------------------------
-   Net helpers with timeout/cache
---------------------------- */
-const NET = document.getElementById("net");
-function setNet(s){ NET.textContent = s; }
-
-async function fetchJSON(url, opts = {}, bodyObj = null){
-  const attempt = async () => {
-    const ctrl = new AbortController();
-    const t = setTimeout(()=>ctrl.abort(), FETCH_TIMEOUT_MS);
-    try{
-      const resp = await fetch(url, {
-        method: bodyObj ? "POST" : (opts.method || "GET"),
-        headers: bodyObj ? {"Content-Type":"application/json", ...(opts.headers||{})} : (opts.headers||{}),
-        body: bodyObj ? JSON.stringify(bodyObj) : (opts.body || undefined),
-        signal: ctrl.signal,
-        cache: "no-store",
-        mode: "cors",
-        keepalive: false,
-      });
-      if(!resp.ok) throw new Error("HTTP "+resp.status);
-      return await resp.json();
-    } finally {
-      clearTimeout(t);
-    }
-  };
-  let lastErr;
-  for(let k=0;k<=RETRIES;k++){
-    try{ return await attempt(); }catch(e){ lastErr = e; }
-  }
-  throw lastErr;
+async function loadJSON(path){ const r=await fetch(path, {cache:"no-store"}); if(!r.ok) throw new Error(path); return r.json(); }
+async function bootLoad(){
+  PACK = await loadJSON("species_pack.json");
+  TOPO = await loadJSON("tree_topology.json");
+  if (!PACK || !TOPO) throw new Error("Missing precomputed files");
 }
 
-/* --------------------------
-   State
---------------------------- */
-let LIST = [];           // [{sci}]
-let TARGET = null;       // {sci, ott, common}
-let GUESSES = [];        // [{sci, ott, common}]
-let turns = 0;
+/* ---------- Indexes & helpers ---------- */
+const name2ott = new Map(); // lower name -> ott
+const ott2sci = new Map();
+const ott2common = new Map();
 
-// Caches
-const TNRS_CACHE = new Map();          // nameLower -> {ott,sci}
-const VERN_CACHE = new Map();          // ott -> common name or null
-const OTT2SCI = new Map();             // ott -> sci (from TNRS resolutions of target/guesses)
-const OTT2COMMON = new Map();          // ott -> common (lazy)
+function initMaps(){
+  for (const [k,v] of Object.entries(PACK.name_to_ott)) name2ott.set(k, v);
+  for (const sp of PACK.species){
+    ott2sci.set(sp.ott, sp.sci);
+    if (sp.common){ ott2common.set(sp.ott, sp.common); name2ott.set(sp.common.toLowerCase(), sp.ott); }
+  }
+}
 
 function el(id){ return document.getElementById(id); }
-function setTurns(n){ turns = n; el("turns").textContent = `turns: ${turns}`; }
+function setTurns(n){ el("turns").textContent = `turns: ${n}`; }
 function setPool(n){ el("pool").textContent = `pool: ${n}`; }
 function setHint(t){ el("hint").textContent = t || ""; }
 
-/* --------------------------
-   Load list & datalist
---------------------------- */
-async function loadTxtList(){
-  try{
-    const r = await fetch(TXT_PATH, {cache:"no-store"});
-    if(!r.ok) throw new Error("missing list");
-    const text = await r.text();
-    const lines = text.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
-    const genus = /[A-Z][a-zà-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ\-]*/.source;
-    const epithet = /(?:×\s*)?[a-zà-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ\-]*/.source;
-    const re = new RegExp(`^${genus}\\s+${epithet}(?:\\s+${epithet}){0,2}$`);
-    const seen = new Set();
-    LIST = lines.filter(s=>re.test(s)).filter(s=>{
-      const k=s.toLowerCase(); if(seen.has(k)) return false; seen.add(k); return true;
-    }).map(s=>({sci:s}));
-    setPool(LIST.length);
-    const dl = el("namelist");
-    for(const s of LIST.slice(0,1500)){ const o=document.createElement("option"); o.value=s.sci; dl.appendChild(o); }
-  } catch { setPool(0); }
-}
+/* ---------- LCA (binary lifting) ---------- */
+let up=null, depth=null;
+function buildLCA(){
+  const n = TOPO.n, parent = TOPO.parent;
+  depth = new Int32Array(n);
+  const LOG = Math.ceil(Math.log2(Math.max(1,n)));
+  up = Array.from({length:LOG+1}, ()=>new Int32Array(n).fill(-1));
 
-/* --------------------------
-   OpenTree / OneZoom helpers (cached)
---------------------------- */
-async function tnrsResolve(name){
-  const key = name.toLowerCase();
-  if (TNRS_CACHE.has(key)) return TNRS_CACHE.get(key);
-  setNet("resolving…");
-  try{
-    const j = await fetchJSON(TNRS_URL, {}, { names:[name], do_approximate_matching:true });
-    const tax = j?.results?.[0]?.matches?.[0]?.taxon;
-    const out = (tax?.ott_id && tax?.name) ? { ott: tax.ott_id, sci: tax.name } : null;
-    TNRS_CACHE.set(key, out);
-    return out;
-  } finally {
-    setNet("idle");
+  // Build children list for a BFS from root to compute depths
+  const kids = Array.from({length:n}, ()=>[]);
+  for (let v=0; v<n; v++){ const p = parent[v]; if (p>=0) kids[p].push(v); }
+  const root = TOPO.root;
+  const q = [root]; depth[root]=0; up[0][root] = -1;
+  for(let qi=0; qi<q.length; qi++){
+    const v = q[qi];
+    for (const w of kids[v]){ depth[w] = depth[v]+1; up[0][w] = v; q.push(w); }
   }
-}
-
-async function vernacularEN(ott){
-  if (VERN_CACHE.has(ott)) return VERN_CACHE.get(ott);
-  setNet("vernacular…");
-  try{
-    const j = await fetchJSON(`${OZ_VERNACULAR_URL}?ott=${ott}&lang=en`);
-    const k = Object.keys(j)[0];
-    const out = (k && j[k]) ? j[k] : null;
-    VERN_CACHE.set(ott, out);
-    return out;
-  } finally {
-    setNet("idle");
-  }
-}
-
-/* --------------------------
-   Induced subtree (id labels)
---------------------------- */
-async function inducedSubtree(ottIds){
-  setNet("tree…");
-  try{
-    const j = await fetchJSON(INDUCED_URL, {}, { ott_ids: ottIds, label_format: "id" }); // faster
-    return j?.newick || null;
-  } finally {
-    setNet("idle");
-  }
-}
-
-/* --------------------------
-   Newick parser (minimal)
---------------------------- */
-function parseNewick(s){
-  let i = 0;
-  function skipWS(){ while(/\s/.test(s[i])) i++; }
-  function parseLabel(){
-    skipWS(); let lab = "";
-    while(i < s.length && !/[(),:;]/.test(s[i])) lab += s[i++];
-    return lab.trim() || null;
-  }
-  function parseNode(){
-    skipWS();
-    let node = {};
-    if(s[i] === "("){
-      i++; node.children = [];
-      while(true){
-        node.children.push(parseNode());
-        skipWS();
-        if(s[i] === ","){ i++; continue; }
-        if(s[i] === ")"){ i++; break; }
-        break;
-      }
-      skipWS();
-      const maybe = parseLabel();
-      if(maybe) node.label = maybe;
-    } else {
-      const lab = parseLabel();
-      if(lab) node.label = lab;
+  for(let j=1;j<up.length;j++){
+    for(let v=0; v<n; v++){
+      const mid = up[j-1][v];
+      up[j][v] = (mid>=0 ? up[j-1][mid] : -1);
     }
-    skipWS();
-    if(s[i] === ":"){ i++; while(i<s.length && !/[),;]/.test(s[i])) i++; }
-    return node;
   }
-  return parseNode();
+}
+function lca(a,b){
+  if (a===b) return a;
+  if (depth[a] < depth[b]) [a,b] = [b,a];
+  let diff = depth[a]-depth[b];
+  for(let j=0; diff>0; j++, diff>>=1){ if (diff&1) a = up[j][a]; }
+  if (a===b) return a;
+  for(let j=up.length-1;j>=0;j--){
+    if (up[j][a] !== up[j][b]){ a = up[j][a]; b = up[j][b]; }
+  }
+  return up[0][a];
 }
 
-// labels are just numbers with "ott" prefix or raw IDs depending on API; handle both
-function labelToOtt(label){
-  if(!label) return null;
-  // examples: "ott417950" or "417950"
-  const m = label.match(/(?:ott)?(\d+)/i);
-  return m ? parseInt(m[1],10) : null;
+/* ---------- Build minimal connecting subtree ---------- */
+function pathToRoot(v){
+  const p = TOPO.parent; const out = [];
+  while (v>=0){ out.push(v); v = p[v]; }
+  return out; // v..root
+}
+function minimalSubtreeFor(leafNodeIndices){
+  // union of paths + all their pairwise LCAs with target
+  const keep = new Set();
+  const addPath = (v)=>{ while(v>=0 && !keep.has(v)){ keep.add(v); v = TOPO.parent[v]; } };
+  for (const v of leafNodeIndices) addPath(v);
+  // compress: build children for kept nodes with only kept children
+  const children = new Map();
+  for (const v of keep){
+    const ch = [];
+    for (let i=0;i<TOPO.n;i++){
+      if (TOPO.parent[i]===v && keep.has(i)) ch.push(i);
+    }
+    children.set(v, ch);
+  }
+  // find display root = LCA of all leaves
+  let root = leafNodeIndices[0];
+  for (let i=1;i<leafNodeIndices.length;i++) root = lca(root, leafNodeIndices[i]);
+  return { keep, children, root };
 }
 
-/* --------------------------
-   D3 rendering
---------------------------- */
+/* ---------- D3 drawing ---------- */
 const svg = d3.select("#tree");
 const g = svg.append("g");
 const linksG = g.append("g").attr("class","links");
@@ -252,23 +161,22 @@ const nodesG = g.append("g").attr("class","nodes");
 const zoom = d3.zoom().scaleExtent([0.4, 3]).on("zoom", (ev)=> g.attr("transform", ev.transform));
 svg.call(zoom);
 
-function buildHierarchy(n){
-  function wrap(node){
-    const children = node.children?.map(wrap) || null;
-    const h = d3.hierarchy(node, d=>children);
-    if(node.label){
-      h.data.ott = labelToOtt(node.label);
-    }
-    return h;
-  }
-  return wrap(n);
+function buildHierarchyFromKeep(keep, children, rootIdx){
+  // convert to a small hierarchy that d3.cluster can read
+  const toNode = (idx)=>{
+    const node = { idx, children:[] };
+    const ch = children.get(idx) || [];
+    node.children = ch.map(toNode);
+    return node;
+  };
+  return d3.hierarchy(toNode(rootIdx), d=>d.children);
 }
 
-function treeLayoutAndFit(root){
+function treeLayoutAndFit(root, isTargetLeaf){
   const tree = d3.cluster().nodeSize([22, 140]);
   tree(root);
 
-  const link = linksG.selectAll("path").data(root.links(), d=>d.target.data.ott||Math.random());
+  const link = linksG.selectAll("path").data(root.links(), d=>d.target.data.idx);
   link.join(
     enter => enter.append("path").attr("class","link")
       .attr("d", d=>`M${d.source.y},${d.source.x}L${d.target.y},${d.target.x}`),
@@ -276,32 +184,34 @@ function treeLayoutAndFit(root){
     exit => exit.remove()
   );
 
-  const nodes = nodesG.selectAll("g.node").data(root.descendants(), d=>d.data.ott||d.depth+":"+d.x);
+  const nodes = nodesG.selectAll("g.node").data(root.descendants(), d=>d.data.idx);
   nodes.join(
     enter => {
       const ng = enter.append("g").attr("class","node").attr("transform", d=>`translate(${d.y},${d.x})`);
-      const leaf = ng.filter(d=>!d.children).classed("leaf", true);
-      ng.filter(d=>d.children).append("circle").attr("r",2);
-      leaf.append("text").attr("class","label").attr("x", 6).text(d=>{
-        const isTarget = (d.data.ott === TARGET?.ott);
-        return isTarget ? "?" : (OTT2SCI.get(d.data.ott) || "");
-      }).classed("target", d=>d.data.ott===TARGET?.ott);
-      leaf.append("text").attr("class","hint").attr("x", 6).attr("dy","1.1em").text(d=>{
-        const isTarget = (d.data.ott === TARGET?.ott);
-        if(isTarget) return "";
-        return OTT2COMMON.get(d.data.ott) || "";
+      const lc = ng.filter(d=> (childrenCount(d.data.idx)===0) ).classed("leaf", true);
+      ng.filter(d=>childrenCount(d.data.idx)>0).append("circle").attr("r",2);
+      lc.append("text").attr("class","label").attr("x",6).text(d=>{
+        const ott = TOPO.index_ott[d.data.idx];
+        if (ott === TARGET.ott) return "?";
+        return ott2sci.get(ott) || "";
+      }).classed("target", d=>TOPO.index_ott[d.data.idx]===TARGET.ott);
+      lc.append("text").attr("class","hint").attr("x",6).attr("dy","1.1em").text(d=>{
+        const ott = TOPO.index_ott[d.data.idx];
+        if (ott === TARGET.ott) return "";
+        return ott2common.get(ott) || "";
       });
       return ng;
     },
     update => update.attr("transform", d=>`translate(${d.y},${d.x})`)
       .select("text.label").text(d=>{
-        const isTarget = (d.data.ott === TARGET?.ott);
-        return isTarget ? "?" : (OTT2SCI.get(d.data.ott) || "");
+        const ott = TOPO.index_ott[d.data.idx];
+        if (ott === TARGET.ott) return "?";
+        return ott2sci.get(ott) || "";
       }),
     exit => exit.remove()
   );
 
-  // Fit view to content
+  // Fit to content
   const all = root.descendants();
   const minX = d3.min(all, d=>d.x), maxX = d3.max(all, d=>d.x);
   const minY = d3.min(all, d=>d.y), maxY = d3.max(all, d=>d.y);
@@ -315,142 +225,115 @@ function treeLayoutAndFit(root){
   svg.transition().duration(400).call(zoom.transform, d3.zoomIdentity.translate(tx, ty).scale(s));
 }
 
-/* --------------------------
-   Tooltip (optional hover)
---------------------------- */
-const tip = document.getElementById("tooltip");
-function showTip(html, x, y){ tip.innerHTML = html; tip.style.left = (x+12)+"px"; tip.style.top = (y+12)+"px"; tip.style.opacity = 1; }
-function hideTip(){ tip.style.opacity = 0; }
-
-/* --------------------------
-   Game flow
---------------------------- */
-function pickRandom(){ return LIST[Math.floor(Math.random()*LIST.length)]?.sci || "Opisthocomus hoazin"; }
-
-async function resolveOne(name){
-  const tn = await tnrsResolve(name);
-  if(!tn) return null;
-  // cache sci + ott
-  OTT2SCI.set(tn.ott, tn.sci);
-  return { sci: tn.sci, ott: tn.ott, common: null }; // common added lazily
+function childrenCount(v){
+  let c = 0;
+  for (let i=0;i<TOPO.n;i++) if (TOPO.parent[i]===v) c++;
+  return c;
 }
 
-function bumpTurn(){ setTurns(turns+1); }
+/* ---------- Game state ---------- */
+let TARGET=null;
+let GUESSES=[];
 
-async function startNewGame(){
-  setHint("choosing…");
+function pickRandomOTT(){
+  const arr = PACK.species;
+  const r = arr[Math.floor(Math.random()*arr.length)];
+  return r.ott;
+}
+
+function updateDatalist(){
+  const dl = document.getElementById("namelist");
+  dl.innerHTML = "";
+  const names = [];
+  for (const sp of PACK.species){ names.push(sp.sci); if (sp.common) names.push(sp.common); }
+  for (const v of names.slice(0, 2000)){ const o=document.createElement("option"); o.value=v; dl.appendChild(o); }
+}
+
+function resetUI(){
+  document.getElementById("status").style.display="none";
+  document.getElementById("guess").value="";
+  document.getElementById("guess").focus();
+}
+
+function renderInitial(){
+  linksG.selectAll("*").remove(); nodesG.selectAll("*").remove();
+  const w = svg.node().clientWidth, h = svg.node().clientHeight;
+  const ng = nodesG.append("g").attr("class","leaf").attr("transform", `translate(${w/2-30},${h/2})`);
+  ng.append("text").attr("class","label target").text("?").attr("font-size","20px");
+  svg.call(d3.zoom().transform, d3.zoomIdentity);
+}
+
+function renderPartial(){
+  if (GUESSES.length===0){ renderInitial(); return; }
+  // node indices for leaves in play (target + all guessed)
+  const indices = [];
+  const targetIdx = TOPO.ott_index[String(TARGET.ott)];
+  indices.push(targetIdx);
+  for (const g of GUESSES){
+    const idx = TOPO.ott_index[String(g.ott)];
+    if (idx!=null) indices.push(idx);
+  }
+  // build minimal subtree
+  // include LCAs pairwise with target automatically via path union
+  const ms = minimalSubtreeFor(indices);
+  const h = buildHierarchyFromKeep(ms.keep, ms.children, ms.root);
+  treeLayoutAndFit(h);
+}
+
+/* ---------- Actions ---------- */
+async function newGame(){
   setTurns(0);
-  GUESSES = [];
-  el("status").style.display = "none";
-  el("guess").value = ""; el("guess").focus();
-
-  // Resolve target (with retries)
-  let t = null;
-  for(let k=0;k<8 && !t;k++){
-    t = await resolveOne(pickRandom());
-  }
-  if(!t){ t = await resolveOne("Opisthocomus hoazin"); }
-  TARGET = t;
-  setHint(OTT2SCI.get(TARGET.ott));
-
-  // kick off vernacular fetch in background (doesn't block)
-  vernacularEN(TARGET.ott).then(v=>{ if(v){ OTT2COMMON.set(TARGET.ott, v); } renderCurrentTree(); });
-
-  renderCurrentTree(); // initial "?"
+  GUESSES.length = 0;
+  TARGET = { ott: pickRandomOTT() };
+  setHint(ott2sci.get(TARGET.ott));
+  resetUI();
+  renderPartial();
 }
 
-async function submitGuess(){
-  const raw = el("guess").value.trim();
-  if(!raw) return;
-
-  // Resolve guess quickly (TNRS only; no vernacular yet)
-  const resolved = await resolveOne(raw);
-  if(!resolved){ bumpTurn(); return; }
-
-  // ignore duplicate guesses
-  if(GUESSES.some(g=>g.ott===resolved.ott)){ el("guess").value=""; el("guess").focus(); return; }
-
-  GUESSES.push(resolved);
-  bumpTurn();
-
-  // Target found
-  if(resolved.ott === TARGET.ott){
-    renderCurrentTree();
-    const box = el("status");
+function submitGuess(){
+  const raw = document.getElementById("guess").value.trim();
+  if (!raw) return;
+  const ott = name2ott.get(raw.toLowerCase());
+  setTurns(parseInt(document.getElementById("turns").textContent.replace(/\D+/g,""))+1);
+  if (!ott){ // unrecognized
+    const box = document.getElementById("status");
     box.style.display = "block";
-    box.innerHTML = `<div class="good">You found it in ${turns} turn${turns===1?"":"s"} 🎉</div>
-      <div><strong>Target:</strong> ${OTT2COMMON.get(TARGET.ott) ? OTT2COMMON.get(TARGET.ott)+" — " : ""}<span class="mono">${OTT2SCI.get(TARGET.ott)}</span> (OTT ${TARGET.ott})</div>`;
-    el("guess").value=""; el("guess").focus(); 
-    // lazily fetch vernacular for the guessed one too
-    vernacularEN(resolved.ott).then(v=>{ if(v){ OTT2COMMON.set(resolved.ott, v); renderCurrentTree(); } });
+    box.innerHTML = `<div class="bad">Not recognized: <span class="mono">${raw}</span></div>`;
+    resetUI();
     return;
   }
+  // duplicate?
+  if (GUESSES.some(g=>g.ott===ott)) { resetUI(); return; }
 
-  // Render current partial tree; vernaculars fetched in background (non-blocking)
-  renderCurrentTree();
-  vernacularEN(resolved.ott).then(v=>{ if(v){ OTT2COMMON.set(resolved.ott, v); renderCurrentTree(); } });
-
-  el("guess").value=""; el("guess").focus();
-}
-
-/* --------------------------
-   Build + render the partial tree
---------------------------- */
-async function renderCurrentTree(){
-  // If no guesses yet, draw a single "?"
-  if(GUESSES.length === 0){
-    linksG.selectAll("*").remove(); nodesG.selectAll("*").remove();
-    const w = svg.node().clientWidth, h = svg.node().clientHeight;
-    const ng = nodesG.append("g").attr("class","leaf").attr("transform", `translate(${w/2-30},${h/2})`);
-    ng.append("text").attr("class","label target").text("?").attr("font-size","20px");
-    svg.call(zoom.transform, d3.zoomIdentity);
-    return;
-  }
-
-  const otts = [TARGET.ott, ...GUESSES.map(g=>g.ott)];
-  let newick = null;
-  try{
-    document.body.classList.add("busy");
-    newick = await inducedSubtree(otts);
-  } catch(e){
-    document.body.classList.remove("busy");
-    console.warn("induced_subtree failed:", e);
-    // Soft error: show a toast-ish status
-    const box = el("status");
+  GUESSES.push({ ott });
+  if (ott === TARGET.ott){
+    renderPartial();
+    const box = document.getElementById("status");
     box.style.display = "block";
-    box.innerHTML = `<div class="bad">Network issue fetching subtree. Try the same guess again.</div>`;
+    const cn = ott2common.get(TARGET.ott);
+    box.innerHTML = `<div class="good">You found it in ${document.getElementById("turns").textContent.split(": ")[1]} 🎉</div>
+      <div><strong>Target:</strong> ${cn ? cn+" — " : ""}<span class="mono">${ott2sci.get(TARGET.ott)}</span> (OTT ${TARGET.ott})</div>`;
+    resetUI();
     return;
-  } finally {
-    document.body.classList.remove("busy");
   }
-  if(!newick) return;
-
-  // Parse & render
-  const parsed = parseNewick(newick);
-  const root = buildHierarchy(parsed);
-
-  // Hover tips for guessed leaves only (target just shows "Target")
-  nodesG.on("mousemove", (ev)=>{
-    const d = d3.select(ev.target.parentNode).datum();
-    if(!d || d.children) return hideTip();
-    const isTarget = (d.data.ott === TARGET?.ott);
-    if(isTarget){ showTip("<b>Target</b>", ev.clientX, ev.clientY); return; }
-    const sci = OTT2SCI.get(d.data.ott) || "";
-    const common = OTT2COMMON.get(d.data.ott);
-    showTip(`<b>${sci}</b>${common ? " — <i>"+common+"</i>" : ""}`, ev.clientX, ev.clientY);
-  }).on("mouseleave", hideTip);
-
-  treeLayoutAndFit(root);
+  renderPartial();
+  resetUI();
 }
 
-/* --------------------------
-   Wire up UI + boot
---------------------------- */
+/* ---------- Boot ---------- */
+(async function(){
+  await bootLoad();
+  initMaps();
+  setPool(PACK.species.length);
+  updateDatalist();
+  buildLCA();
+  setTurns(0);
+  newGame();
+})();
+
 document.getElementById("submit").addEventListener("click", submitGuess);
 document.getElementById("guess").addEventListener("keydown", e=>{ if(e.key==="Enter") submitGuess(); });
-document.getElementById("newgame").addEventListener("click", startNewGame);
-
-loadTxtList().then(startNewGame);
+document.getElementById("newgame").addEventListener("click", newGame);
 </script>
 </body>
 </html>
