@@ -1,292 +1,147 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <title>Species Guessing Game — Simple Distance Mode</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>
-    :root { --card:#fff; --ink:#111; --muted:#666; --line:#e5e7eb; --good:#0a7d25; --bad:#a60d0d; }
-    html,body{margin:0;padding:0;background:#fafafa;color:var(--ink);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;}
-    .wrap{max-width:840px;margin:28px auto;padding:0 16px;}
-    h1{margin:0 0 4px}
-    .muted{color:var(--muted)}
-    .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:12px}
-    input[type=text]{flex:1;min-width:260px;padding:10px 12px;border:1px solid var(--line);border-radius:10px;font-size:16px}
-    button{padding:10px 14px;border:1px solid var(--line);border-radius:10px;background:white;cursor:pointer}
-    button:hover{background:#f3f4f6}
-    .pill{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border:1px solid var(--line);border-radius:999px;background:#fff}
-    .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}
-    .good{color:var(--good);font-weight:700}
-    .bad{color:var(--bad);font-weight:700}
-    .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-    .section{margin-top:18px}
-    .list{display:flex;flex-direction:column;gap:8px}
-    .small{font-size:14px}
-    .footer{margin-top:28px;color:var(--muted);font-size:14px}
-    .chip{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:2px 8px;margin-left:6px;font-size:12px;color:#444}
-    .net{font-size:12px;color:#555}
-  </style>
+<meta charset="utf-8">
+<title>Precompute Common Names (GBIF)</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root{--line:#e5e7eb;--ink:#111;--muted:#666;}
+  body{font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:24px;color:var(--ink)}
+  h1{margin:0 0 6px}
+  .muted{color:var(--muted)}
+  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:12px 0}
+  button{padding:10px 14px;border:1px solid var(--line);border-radius:10px;background:#fff;cursor:pointer}
+  button:hover{background:#f3f4f6}
+  progress{width:360px;height:10px}
+  pre{background:#fff;border:1px solid var(--line);border-radius:10px;padding:10px;max-height:280px;overflow:auto}
+  .ok{color:#0a7d25;font-weight:600}
+  .warn{color:#a60d0d;font-weight:600}
+</style>
 </head>
 <body>
-<div class="wrap">
-  <h1>Species Guessing Game</h1>
-  <p class="muted">After each guess I show the taxonomy-tree <em>distance</em> to the secret target (smaller = closer). Distance 0 = correct 🎯</p>
+<h1>Precompute Common Names</h1>
+<p class="muted">Reads <code>extracted_species.txt</code>, asks GBIF for English vernacular names, and downloads <code>common_names.json</code>.</p>
 
-  <div class="row">
-    <button id="newgame">New game</button>
-    <span id="turns" class="pill">turns: 0</span>
-    <span id="hint" class="pill small"></span>
-    <span id="net" class="net">idle</span>
-  </div>
-
-  <div class="row">
-    <input id="guess" type="text" list="names" placeholder="Type a scientific or common name" autocomplete="off" />
-    <datalist id="names"></datalist>
-    <button id="submit">Guess</button>
-  </div>
-
-  <div id="status" class="card section" style="display:none;"></div>
-
-  <div class="section">
-    <h3>Closest so far</h3>
-    <div id="closest" class="card small">None yet — make a guess.</div>
-  </div>
-
-  <div class="section">
-    <h3>All guesses</h3>
-    <div id="log" class="list"></div>
-  </div>
-
-  <div class="footer">Uses OpenTree TNRS + Taxonomy (lineages). No big tree downloads.</div>
+<div class="row">
+  <label>Species text file:
+    <input id="file" type="file" accept=".txt">
+  </label>
+  <button id="start">Start</button>
 </div>
 
+<div class="row">
+  <span>Progress:</span><progress id="prog" value="0" max="1"></progress>
+  <span id="status" class="muted">idle</span>
+</div>
+
+<pre id="log"></pre>
+
 <script>
-/* --------------------------
-   Config
---------------------------- */
-const OT = "https://api.opentreeoflife.org/v3";
-const TNRS = `${OT}/tnrs/match_names`;
-const TAXON_INFO = `${OT}/taxonomy/taxon_info`;
-const TXT_PATH = "extracted_species.txt"; // optional; used only for the datalist
+const GBIF_MATCH = "https://api.gbif.org/v1/species/match";              // ?name=Genus%20species
+const GBIF_VERN  = (key)=>`https://api.gbif.org/v1/species/${key}/vernacularNames?limit=200&language=en`;
 
-const NET = document.getElementById("net");
-function net(s){ NET.textContent = s; }
+const statusEl = document.getElementById("status");
+const logEl = document.getElementById("log");
+const prog = document.getElementById("prog");
+function setStatus(s){ statusEl.textContent = s; }
+function log(m){ logEl.textContent += m + "\n"; logEl.scrollTop = logEl.scrollHeight; }
 
-/* --------------------------
-   Net helper (timeout + retries)
---------------------------- */
-const TIMEOUT = 9000, RETRIES = 2;
-async function fetchJSON(url, body=null){
-  const attempt = async ()=>{
-    const ctrl = new AbortController();
-    const t = setTimeout(()=>ctrl.abort(), TIMEOUT);
+function saveJSON(obj, name){
+  const blob = new Blob([JSON.stringify(obj)], {type:"application/json"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+async function fetchJSON(url){
+  const ctrl = new AbortController();
+  const t = setTimeout(()=>ctrl.abort(), 12000);
+  try{
+    const r = await fetch(url, {signal: ctrl.signal, cache:"no-store"});
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    return await r.json();
+  } finally { clearTimeout(t); }
+}
+
+function parseLines(text){
+  const genus = /[A-Z][a-zà-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ\-]*/.source;
+  const epithet = /(?:×\s*)?[a-zà-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ\-]*/.source;
+  const re = new RegExp(`^${genus}\\s+${epithet}(?:\\s+${epithet}){0,2}$`);
+  const seen = new Set();
+  return text.split(/\r?\n/)
+    .map(s=>s.trim()).filter(Boolean)
+    .filter(s=>re.test(s))
+    .filter(s=>{ const k=s.toLowerCase(); if(seen.has(k)) return false; seen.add(k); return true; });
+}
+
+// choose the “best” English common name from GBIF vernaculars
+function pickBestCommon(rows){
+  if (!rows || !rows.length) return null;
+  // prefer those flagged preferred/accepted; else shortest nice name
+  const preferred = rows.filter(r => r.language==="eng" || r.language==="en" || r.language==="en_US" || r.language==="en_GB")
+                        .filter(r => r.preferred || r.source==="Catalogue of Life" || r.source==="GBIF Backbone Taxonomy");
+  const pool = preferred.length ? preferred : rows;
+  // strip weird punctuation, pick shortest reasonable
+  const cleaned = pool.map(r => (r.vernacularName||"").trim()).filter(Boolean);
+  if (!cleaned.length) return null;
+  cleaned.sort((a,b)=> a.length - b.length);
+  return cleaned[0];
+}
+
+async function run(){
+  const file = document.getElementById("file").files?.[0];
+  if(!file){ alert("Choose extracted_species.txt"); return; }
+  const text = await file.text();
+  const names = parseLines(text);
+  log(`Loaded ${names.length} scientific names`);
+
+  const entries = []; // {sci, common|null}
+  const name_to_common = {}; // lower -> common
+
+  prog.value = 0; prog.max = names.length;
+
+  // throttle: GBIF is pretty ok, but we’ll be polite (~6–8 req/s)
+  const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
+  let success = 0, withCommon = 0;
+
+  for (let i=0;i<names.length;i++){
+    const sci = names[i];
+    setStatus(`Matching ${i+1}/${names.length}`);
     try{
-      const resp = await fetch(url,{
-        method: body ? "POST":"GET",
-        headers: body ? {"Content-Type":"application/json"} : undefined,
-        body: body ? JSON.stringify(body) : undefined,
-        signal: ctrl.signal,
-        cache: "no-store",
-        mode: "cors",
-      });
-      if(!resp.ok) throw new Error("HTTP "+resp.status);
-      return await resp.json();
-    } finally { clearTimeout(t); }
-  };
-  let err;
-  for(let k=0;k<=RETRIES;k++){
-    try{ return await attempt(); }catch(e){ err=e; }
-  }
-  throw err;
-}
+      const m = await fetchJSON(`${GBIF_MATCH}?name=${encodeURIComponent(sci)}`);
+      if (!m || !m.usageKey){ entries.push({sci, common:null}); prog.value=i+1; await sleep(80); continue; }
+      success++;
 
-/* --------------------------
-   Caches
---------------------------- */
-const TNRS_CACHE = new Map();     // key: nameLower -> {ott,sci} or null
-const LINEAGE_CACHE = new Map();  // key: ott -> [{name,ott}, tip→root]
-const COMMON_CACHE = new Map();   // key: sci(lower) -> best-known common (from TNRS synonym field if exposed)
-
-/* --------------------------
-   Helpers
---------------------------- */
-async function tnrs(name){
-  const key = name.toLowerCase();
-  if (TNRS_CACHE.has(key)) return TNRS_CACHE.get(key);
-  net("resolving…");
-  try{
-    const j = await fetchJSON(TNRS, { names:[name], do_approximate_matching:true });
-    const t = j?.results?.[0]?.matches?.[0]?.taxon;
-    if (!t?.ott_id || !t?.name){ TNRS_CACHE.set(key,null); return null; }
-    const out = { ott: t.ott_id, sci: t.name };
-    TNRS_CACHE.set(key, out);
-    return out;
-  } finally { net("idle"); }
-}
-
-async function lineage(ott){
-  if (LINEAGE_CACHE.has(ott)) return LINEAGE_CACHE.get(ott);
-  net("lineage…");
-  try{
-    const j = await fetchJSON(TAXON_INFO, { ott_id: ott, include_lineage: true });
-    // normalize to tip→root, drop true roots
-    let arr = Array.isArray(j.lineage) ? j.lineage.slice() : [];
-    // If first entry looks like root, reverse
-    if (arr.length && (arr[0].ott_id===805080 || (arr[0].name||"").toLowerCase()==="life")) arr = arr.reverse();
-    const clean = arr.filter(a=>{
-      const nm = (a.name||"").toLowerCase();
-      return a.ott_id !== 805080 && nm !== "life" && nm !== "cellular organisms";
-    }).map(a => ({name: a.name||"", ott: a.ott_id||null}));
-    LINEAGE_CACHE.set(ott, clean);
-    return clean;
-  } finally { net("idle"); }
-}
-
-// taxonomy distance via lineage intersection (nearest shared ancestor)
-async function taxonomyDistance(ottA, ottB){
-  if (ottA===ottB) return 0;
-  const la = await lineage(ottA);
-  const lb = await lineage(ottB);
-  if (!la.length || !lb.length) return Infinity;
-
-  const posB = new Map(); // ott -> index (steps from A tip/root orientation handled by clean)
-  for (let i=0;i<lb.length;i++) if (lb[i].ott) posB.set(lb[i].ott, i);
-
-  // la and lb are tip→root without root; index is steps upward from tip
-  for (let i=0;i<la.length;i++){
-    const id = la[i].ott;
-    if (id && posB.has(id)){
-      const j = posB.get(id);
-      return i + j; // i steps from A to shared, j from B to shared
+      const vj = await fetchJSON(GBIF_VERN(m.usageKey));
+      const common = pickBestCommon(vj?.results||[]);
+      entries.push({sci, common: common || null});
+      if (common){
+        withCommon++;
+        name_to_common[sci.toLowerCase()] = common;
+        name_to_common[common.toLowerCase()] = common; // allow direct lookup by common later
+      }
+    } catch(e){
+      entries.push({sci, common:null});
     }
-  }
-  return Infinity;
-}
-
-/* --------------------------
-   UI helpers
---------------------------- */
-function el(id){ return document.getElementById(id); }
-function setTurns(n){ el("turns").textContent = `turns: ${n}`; }
-function getTurns(){ return Number(el("turns").textContent.replace(/[^\d]/g,""))||0; }
-function setHint(t){ el("hint").textContent = t || ""; }
-function showStatus(html, kind="bad"){
-  const box = el("status");
-  box.style.display = "block";
-  box.innerHTML = `<div class="${kind}">${html}</div>`;
-}
-function clearStatus(){ el("status").style.display = "none"; }
-
-/* --------------------------
-   Datalist (optional)
---------------------------- */
-async function loadNamesFile(){
-  try{
-    const r = await fetch(TXT_PATH, {cache:"no-store"});
-    if (!r.ok) return;
-    const text = await r.text();
-    const lines = text.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
-    const genus = /[A-Z][a-zà-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ\-]*/.source;
-    const epithet = /(?:×\s*)?[a-zà-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ\-]*/.source;
-    const re = new RegExp(`^${genus}\\s+${epithet}(?:\\s+${epithet}){0,2}$`);
-    const names = lines.filter(s=>re.test(s)).slice(0,2500);
-    const dl = el("names");
-    for (const n of names){ const o=document.createElement("option"); o.value=n; dl.appendChild(o); }
-  }catch{}
-}
-
-/* --------------------------
-   Game state
---------------------------- */
-let TARGET=null;   // {ott, sci}
-let GUESSES=[];    // [{ott, sci, dist}]
-function fmtSpecies(sci){ return sci; } // keep it simple for now
-
-async function pickRandomTarget(){
-  // sample a few random names from the optional list or fallback
-  const fallback = ["Opisthocomus hoazin","Loxodonta africana","Zea mays","Iguana iguana","Pan troglodytes","Gadus morhua"];
-  let name = fallback[Math.floor(Math.random()*fallback.length)];
-  try{
-    const r = await fetch(TXT_PATH, {cache:"no-store"});
-    if (r.ok){
-      const txt = await r.text();
-      const arr = txt.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
-      const genus = /[A-Z][a-zà-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ\-]*/.source;
-      const epithet = /(?:×\s*)?[a-zà-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ\-]*/.source;
-      const re = new RegExp(`^${genus}\\s+${epithet}(?:\\s+${epithet}){0,2}$`);
-      const valids = arr.filter(s=>re.test(s));
-      if (valids.length) name = valids[Math.floor(Math.random()*valids.length)];
-    }
-  }catch{}
-  const t = await tnrs(name);
-  return t || await tnrs("Opisthocomus hoazin");
-}
-
-async function newGame(){
-  setTurns(0); GUESSES = []; clearStatus();
-  TARGET = await pickRandomTarget();
-  setHint(TARGET?.sci || "");
-  el("closest").textContent = "None yet — make a guess.";
-  el("log").innerHTML = "";
-  el("guess").value = ""; el("guess").focus();
-}
-
-/* --------------------------
-   Actions
---------------------------- */
-async function submitGuess(){
-  const raw = el("guess").value.trim();
-  if (!raw) return;
-  clearStatus();
-  setTurns(getTurns()+1);
-
-  const t = await tnrs(raw);
-  if (!t){
-    showStatus(`Not recognized: <span class="mono">${raw}</span>`, "bad");
-    el("guess").value = ""; el("guess").focus(); return;
+    prog.value = i+1;
+    // light throttle
+    await sleep(80);
+    if ((i % 25)===0) await sleep(200);
   }
 
-  // ignore duplicates
-  if (GUESSES.some(g=>g.ott===t.ott)){ el("guess").value=""; el("guess").focus(); return; }
-
-  const d = await taxonomyDistance(t.ott, TARGET.ott);
-  GUESSES.push({ ott:t.ott, sci:t.sci, dist:d });
-
-  // Win?
-  if (d === 0){
-    el("closest").innerHTML = `<div><strong>${fmtSpecies(t.sci)}</strong></div>
-      <div>distance to target: <span class="mono">0</span></div>`;
-    const box = el("status");
-    box.style.display = "block";
-    box.innerHTML = `<div class="good">You found it in ${getTurns()} turn${getTurns()===1?"":"s"} 🎉</div>
-      <div><strong>Target:</strong> <span class="mono">${TARGET.sci}</span></div>`;
-    el("guess").value = ""; el("guess").focus(); return;
-  }
-
-  // Update “closest so far”
-  const best = GUESSES.reduce((a,b)=> a.dist<=b.dist ? a : b);
-  el("closest").innerHTML = `
-    <div><strong>${fmtSpecies(best.sci)}</strong></div>
-    <div>distance to target: <span class="mono">${best.dist}</span></div>
-  `;
-
-  // Log
-  const row = document.createElement("div");
-  row.className = "card small";
-  row.innerHTML = `<div><strong>${fmtSpecies(t.sci)}</strong></div>
-                   <div>distance: <span class="mono">${d}</span></div>`;
-  el("log").prepend(row);
-
-  el("guess").value = ""; el("guess").focus();
+  log(`GBIF matched ${success}/${names.length}`);
+  log(`Common names found for ${withCommon}/${names.length}`);
+  setStatus("Saving…");
+  const payload = { version:1, entries, name_to_common };
+  saveJSON(payload, "common_names.json");
+  setStatus("Done ✅");
 }
 
-/* --------------------------
-   Boot
---------------------------- */
-document.getElementById("submit").addEventListener("click", ()=>submitGuess().catch(e=>showStatus("Network hiccup — try again", "bad")));
-document.getElementById("guess").addEventListener("keydown", e=>{ if (e.key==="Enter") submitGuess().catch(()=>{}); });
-document.getElementById("newgame").addEventListener("click", ()=>newGame().catch(()=>{}));
-loadNamesFile().then(newGame);
+document.getElementById("start").onclick = ()=>run().catch(e=>{
+  setStatus("Error"); log("ERROR: "+e.message+"\n"+String(e.stack||""));
+});
 </script>
 </body>
 </html>
